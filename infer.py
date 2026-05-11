@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS_PER_DOMAIN
 from model import PCVRHyFormer, ModelInput
 
 logging.basicConfig(
@@ -42,10 +42,9 @@ logging.basicConfig(
 # fallback path is actually taken the built model will shape-mismatch the
 # saved state_dict.
 #
-# Special note on ``num_time_buckets``: this value is strictly determined by
-# ``dataset.BUCKET_BOUNDARIES`` and is NOT an independent hyperparameter.
-# When the feature is enabled we therefore use the constant exposed by the
-# dataset module; ``0`` mean
+# Special note on ``num_time_buckets``: this is a {domain: n} dict, not a
+# scalar. The sizes come from ``dataset.NUM_TIME_BUCKETS_PER_DOMAIN`` (one
+# embedding table per sequence domain). An empty dict disables the feature.
 _FALLBACK_MODEL_CFG = {
     "d_model": 64,
     "emb_dim": 64,
@@ -58,7 +57,7 @@ _FALLBACK_MODEL_CFG = {
     "seq_top_k": 50,
     "seq_causal": False,
     "action_num": 1,
-    "num_time_buckets": NUM_TIME_BUCKETS,
+    "num_time_buckets": dict(NUM_TIME_BUCKETS_PER_DOMAIN),
     "rank_mixer_mode": "full",
     "use_rope": False,
     "rope_base": 10000.0,
@@ -127,28 +126,35 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
     """Extract model hyperparameters from ``train_config``; missing keys fall
     back to ``_FALLBACK_MODEL_CFG``.
 
-    Special handling for ``num_time_buckets``: it is not exposed on the CLI
-    as an independent hyperparameter; the bucket count is uniquely determined
-    by the length of ``dataset.BUCKET_BOUNDARIES``. Resolution order:
+    Special handling for ``num_time_buckets``: it is a {domain: n} dict whose
+    sizes come from ``dataset.NUM_TIME_BUCKETS_PER_DOMAIN``. Resolution order:
 
-      1) ``train_config`` contains ``num_time_buckets`` directly (legacy ckpt)
-         -> use that value;
-      2) ``train_config`` contains ``use_time_buckets`` (new-style training)
-         -> derive as ``NUM_TIME_BUCKETS`` or ``0``;
-      3) neither is present -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
+      1) ``train_config['num_time_buckets']`` is a dict (new-style ckpt)
+         -> use as-is.
+      2) ``train_config['num_time_buckets']`` is a positive int (legacy ckpt
+         where every domain shared one table) -> not supported with per-domain
+         tables; fall through to use_time_buckets.
+      3) ``train_config['use_time_buckets']`` -> derive from
+         NUM_TIME_BUCKETS_PER_DOMAIN or empty dict.
+      4) neither -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
     """
     cfg: Dict[str, Any] = {}
     for key in _MODEL_CFG_KEYS:
         if key == "num_time_buckets":
-            if "num_time_buckets" in train_config:
-                cfg[key] = train_config["num_time_buckets"]
+            raw = train_config.get("num_time_buckets")
+            if isinstance(raw, dict):
+                cfg[key] = raw
             elif "use_time_buckets" in train_config:
-                cfg[key] = NUM_TIME_BUCKETS if train_config["use_time_buckets"] else 0
+                cfg[key] = (
+                    dict(NUM_TIME_BUCKETS_PER_DOMAIN)
+                    if train_config["use_time_buckets"]
+                    else {}
+                )
             else:
                 cfg[key] = _FALLBACK_MODEL_CFG[key]
                 logging.warning(
-                    f"train_config missing both 'num_time_buckets' and 'use_time_buckets', "
-                    f"using fallback = {cfg[key]}"
+                    f"train_config missing both 'num_time_buckets' (dict) and "
+                    f"'use_time_buckets', using fallback = {cfg[key]}"
                 )
             continue
 

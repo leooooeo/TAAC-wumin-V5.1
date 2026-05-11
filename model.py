@@ -1465,7 +1465,7 @@ class PCVRHyFormer(nn.Module):
         seq_top_k: int = 50,
         seq_causal: bool = False,
         action_num: int = 1,
-        num_time_buckets: int = 65,
+        num_time_buckets: "Optional[dict[str, int]]" = None,
         rank_mixer_mode: str = "full",
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1491,7 +1491,10 @@ class PCVRHyFormer(nn.Module):
         self.num_queries = num_queries
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
-        self.num_time_buckets = num_time_buckets
+        # ``num_time_buckets`` is a {domain: n_buckets} dict (padding slot
+        # included). ``None`` or empty dict disables the time-bucket embedding.
+        self.num_time_buckets: "dict[str, int]" = dict(num_time_buckets or {})
+        self.use_time_buckets: bool = bool(self.num_time_buckets)
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1686,9 +1689,20 @@ class PCVRHyFormer(nn.Module):
         self.seq_gate_uniform_alpha = 0.15
         self.last_seq_weights: Optional[torch.Tensor] = None
 
-        # ================== Time Interval Bucket Embedding (optional) ==================
-        if num_time_buckets > 0:
-            self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+        # ================== Per-domain Time Interval Bucket Embedding (optional) ==
+        # One independent embedding table per sequence domain. Each domain uses
+        # its own bucket boundaries (see dataset.BUCKET_BOUNDARIES_BY_DOMAIN),
+        # so sharing weights across domains would conflate different time
+        # scales. ``padding_idx=0`` keeps slot 0 zero-valued.
+        if self.use_time_buckets:
+            self.time_embeddings = nn.ModuleDict(
+                {
+                    domain: nn.Embedding(
+                        self.num_time_buckets[domain], d_model, padding_idx=0
+                    )
+                    for domain in self.seq_domains
+                }
+            )
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1876,6 +1890,7 @@ class PCVRHyFormer(nn.Module):
         time_bucket_ids: torch.Tensor,
         ts_float_feats: torch.Tensor,
         ts_float_proj: nn.Module,
+        domain: str,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1900,9 +1915,9 @@ class PCVRHyFormer(nn.Module):
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, (S+1)*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
-        # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
-        if self.num_time_buckets > 0:
-            token_emb = token_emb + self.time_embedding(time_bucket_ids)
+        # Add per-domain time bucket embedding (slot 0 is padding -> zero vec).
+        if self.use_time_buckets:
+            token_emb = token_emb + self.time_embeddings[domain](time_bucket_ids)
 
         return token_emb
 
@@ -1955,14 +1970,15 @@ class PCVRHyFormer(nn.Module):
         time_bucket_ids: torch.Tensor,
         padding_mask: torch.Tensor,
         dtype: torch.dtype,
+        domain: str,
     ) -> torch.Tensor:
         """Mask-mean pool per-position time bucket embeddings into (B, D)."""
         B = time_bucket_ids.size(0)
-        if self.num_time_buckets <= 0:
+        if not self.use_time_buckets:
             return time_bucket_ids.new_zeros(B, self.d_model, dtype=dtype)
 
         valid = ~padding_mask
-        time_emb = self.time_embedding(time_bucket_ids)  # (B, L, D)
+        time_emb = self.time_embeddings[domain](time_bucket_ids)  # (B, L, D)
         mask = valid.unsqueeze(-1).to(dtype=time_emb.dtype)
         denom = mask.sum(dim=1).clamp(min=1.0)
         pooled = (time_emb * mask).sum(dim=1) / denom
@@ -2001,6 +2017,7 @@ class PCVRHyFormer(nn.Module):
                 seq_time_buckets_list[i].to(device=q.device),
                 seq_masks_list[i].to(device=q.device),
                 dtype,
+                domain,
             )
 
             gate_input = torch.cat([seq_repr, stat_emb, time_pool], dim=-1)
@@ -2130,6 +2147,7 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_time_buckets[domain],
                 inputs.seq_ts_float_feats[domain],
                 self._seq_ts_float_proj[domain],
+                domain,
             )
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(
@@ -2200,6 +2218,7 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_time_buckets[domain],
                 inputs.seq_ts_float_feats[domain],
                 self._seq_ts_float_proj[domain],
+                domain,
             )
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(

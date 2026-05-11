@@ -4,7 +4,7 @@ Streams a sample of rows from the training parquet, computes
 ``time_diff = sample_ts - event_ts`` per sequence domain, and reports:
 
   1. Per-domain percentile summary (p1..p99.9) and basic stats.
-  2. Current 65-bucket (BUCKET_BOUNDARIES) occupancy + empty / saturated buckets.
+  2. Current per-domain bucket occupancy + empty / saturated buckets.
   3. Proposed quantile-based boundaries (64 edges) per domain.
 
 Env vars:
@@ -24,7 +24,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 # Reuse the production bucket boundaries so the report matches what the model sees.
-from dataset import BUCKET_BOUNDARIES
+from dataset import BUCKET_BOUNDARIES_BY_DOMAIN
 
 
 PERCENTILES = [1, 5, 10, 25, 50, 75, 90, 95, 99, 99.5, 99.9]
@@ -124,14 +124,16 @@ def _collect_time_diffs(
     return out, rows_seen
 
 
-def _current_bucket_occupancy(diffs: np.ndarray) -> np.ndarray:
+def _current_bucket_occupancy(
+    diffs: np.ndarray, boundaries: np.ndarray
+) -> np.ndarray:
     """Replicates dataset.py bucketing: searchsorted(left), clip, +1, padding=0."""
     if diffs.size == 0:
-        return np.zeros(len(BUCKET_BOUNDARIES) + 1, dtype=np.int64)
-    raw = np.searchsorted(BUCKET_BOUNDARIES, diffs, side="left")
-    np.clip(raw, 0, len(BUCKET_BOUNDARIES) - 1, out=raw)
+        return np.zeros(len(boundaries) + 1, dtype=np.int64)
+    raw = np.searchsorted(boundaries, diffs, side="left")
+    np.clip(raw, 0, len(boundaries) - 1, out=raw)
     buckets = raw + 1  # slot 0 reserved for padding
-    counts = np.bincount(buckets, minlength=len(BUCKET_BOUNDARIES) + 1)
+    counts = np.bincount(buckets, minlength=len(boundaries) + 1)
     return counts
 
 
@@ -168,27 +170,33 @@ def _print_percentile_table(diffs: np.ndarray, name: str) -> Dict:
     return stats
 
 
-def _print_bucket_occupancy(diffs: np.ndarray, name: str, top_k: int = 10) -> Dict:
-    counts = _current_bucket_occupancy(diffs)
+def _print_bucket_occupancy(
+    diffs: np.ndarray,
+    name: str,
+    boundaries: np.ndarray,
+    top_k: int = 10,
+) -> Dict:
+    counts = _current_bucket_occupancy(diffs, boundaries)
     total = counts.sum()
+    n_buckets = len(counts)
+    n_real = n_buckets - 1
     if total == 0:
         print(f"\n[{name}] bucket occupancy: empty.")
         return {"counts": counts.tolist()}
 
     pct = counts / total * 100
-    n_buckets = len(counts)  # 65
     empty = int((counts[1:] == 0).sum())  # ignore padding slot 0
-    print(f"\n[{name}] current 65-bucket occupancy "
-          f"(non-padding empty buckets: {empty}/64):")
+    print(f"\n[{name}] current {n_buckets}-bucket occupancy "
+          f"(non-padding empty buckets: {empty}/{n_real}):")
     order = np.argsort(counts)[::-1]
     print(f"  top {top_k} buckets by mass:")
     for rank, bidx in enumerate(order[:top_k]):
         if bidx == 0:
             continue
-        # bucket b (1..64) covers [BUCKET_BOUNDARIES[b-2], BUCKET_BOUNDARIES[b-1])
-        lo = 0 if bidx == 1 else int(BUCKET_BOUNDARIES[bidx - 2])
-        if bidx - 1 < len(BUCKET_BOUNDARIES):
-            hi = int(BUCKET_BOUNDARIES[bidx - 1])
+        # bucket b (1..n_real) covers [boundaries[b-2], boundaries[b-1])
+        lo = 0 if bidx == 1 else int(boundaries[bidx - 2])
+        if bidx - 1 < len(boundaries):
+            hi = int(boundaries[bidx - 1])
             rng = f"[{_human_seconds(lo)}, {_human_seconds(hi)})"
         else:
             rng = f"[{_human_seconds(lo)}, +inf)"
@@ -242,23 +250,32 @@ def main() -> int:
     print(f"[eda] parquet files = {len(parquet_files)}")
     print(f"[eda] domains       = {sorted(domains.keys())}")
     print(f"[eda] row cap       = {max_rows:,}")
-    print(f"[eda] BUCKET_BOUNDARIES has {len(BUCKET_BOUNDARIES)} edges "
-          f"-> {len(BUCKET_BOUNDARIES)+1} buckets (incl. padding=0)")
+    print(f"[eda] per-domain BUCKET_BOUNDARIES_BY_DOMAIN: "
+          + ", ".join(
+              f"{d}={len(b)} edges"
+              for d, b in BUCKET_BOUNDARIES_BY_DOMAIN.items()
+          ))
 
     diffs, rows_seen = _collect_time_diffs(parquet_files, domains, max_rows)
     print(f"\n[eda] sampled rows  = {rows_seen:,}")
 
     report: Dict[str, Dict] = {
         "rows_sampled": rows_seen,
-        "current_boundaries": [int(x) for x in BUCKET_BOUNDARIES.tolist()],
+        "current_boundaries_by_domain": {
+            d: [int(x) for x in b.tolist()]
+            for d, b in BUCKET_BOUNDARIES_BY_DOMAIN.items()
+        },
         "domains": {},
     }
 
     for domain in sorted(diffs.keys()):
         d = diffs[domain]
+        boundaries = BUCKET_BOUNDARIES_BY_DOMAIN.get(
+            domain, np.zeros(0, dtype=np.int64)
+        )
         section = {}
         section["stats"] = _print_percentile_table(d, domain)
-        section["current_occupancy"] = _print_bucket_occupancy(d, domain)
+        section["current_occupancy"] = _print_bucket_occupancy(d, domain, boundaries)
         section["proposed_quantile"] = _print_quantile_proposal(d, domain)
         report["domains"][domain] = section
 
