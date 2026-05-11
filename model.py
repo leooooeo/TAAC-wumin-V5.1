@@ -22,6 +22,18 @@ class ModelInput(NamedTuple):
     seq_time_buckets: dict  # {domain: tensor [B, L]}
     seq_ts_float_feats: dict  # {domain: tensor [B, 8, L]} float time-derived feats
     seq_ts_stat_feats: dict  # {domain: tensor [B, 6]} precomputed time stats
+    # Item-history-user pools (only populated when ItemHistUserModule is enabled
+    # and the dataset was built via build_item_hist_users.py). Each row gets two
+    # variable-length pools of past users that interacted with the same item:
+    #   pos pool: label_type==2 (converters)
+    #   neg pool: label_type==1 (shown but did not convert)
+    # ``hist_*_lens`` masks the K axis. None when the hist branch is disabled.
+    hist_pos_scalars: Optional[torch.Tensor] = None   # (B, K_pos, 7) int64
+    hist_pos_dense: Optional[torch.Tensor] = None     # (B, K_pos, 256) float
+    hist_neg_scalars: Optional[torch.Tensor] = None   # (B, K_neg, 7) int64
+    hist_neg_dense: Optional[torch.Tensor] = None     # (B, K_neg, 256) float
+    hist_pos_lens: Optional[torch.Tensor] = None      # (B,) int32
+    hist_neg_lens: Optional[torch.Tensor] = None      # (B,) int32
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1434,6 +1446,257 @@ class CrossRankMixerNSTokenizer(nn.Module):
         return torch.cat(outs, dim=-1)  # (B, out_dim)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Item-history-user module (audience matching, no item_id required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class UserQueryPool(nn.Module):
+    """Pool the ``num_user_ns`` pre-HyFormer user NS tokens into a single query
+    token via one learnable cross-attention.
+
+    Used as the Q side of ItemHistUserModule's two cross-attentions. We use the
+    PRE-HyFormer user tokens (not the post-HyFormer mixed output) so that the
+    Q and K/V live in the same pure-user semantic space — see project notes.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.attn = CrossAttention(
+            d_model=d_model, num_heads=num_heads, dropout=dropout, ln_mode="pre"
+        )
+
+    def forward(self, user_ns_tokens: torch.Tensor) -> torch.Tensor:
+        """user_ns_tokens: (B, num_user_ns, D) → (B, 1, D)."""
+        B = user_ns_tokens.size(0)
+        q = self.query.expand(B, -1, -1)
+        return self.attn(q, user_ns_tokens, key_padding_mask=None)
+
+
+class ItemHistUserModule(nn.Module):
+    """Encode the per-row item-history-user pools, cross-attend with current
+    user, and produce an add-on contribution that is gated-summed onto the
+    HyFormer output before the classifier head.
+
+    Design notes:
+    - The 7 scalar features per historical user reuse Embedding TABLES of the
+      main ``user_ns_tokenizer`` (passed in by reference, not registered as
+      submodules here, to avoid state_dict duplication). Gradients flow back
+      through the shared tables, keeping current-user and hist-user encodings
+      in the same semantic space.
+    - The 256-d dense_61 user embedding goes through a fresh small MLP that is
+      private to this module.
+    - The two outputs of the per-user encoder are concatenated and projected
+      down to ``d_model``, giving one token per historical user.
+    - Cross-attention: query = single pooled user token (B,1,D); KV = K hist
+      tokens; key_padding_mask is built from ``hist_*_lens``.
+    - Cold-pool fallback: when ``hist_*_lens==0`` or random history dropout
+      fires (training only, prob ``hist_dropout``), the attention output is
+      OVERWRITTEN by a learnable empty token (per pool).
+    - Fusion onto the HyFormer output: ``final = output + gate * delta`` where
+      gate is computed only from ``[pos_tok, neg_tok]`` (two-way, not three);
+      delta is a Linear projection of the same two tokens. Gate ∈ (0,1)^D, so
+      the model can shrink the contribution per-dimension when history is
+      unreliable, and falls back to pure baseline when both pools are empty.
+    """
+
+    def __init__(
+        self,
+        user_ns_tokenizer: nn.Module,
+        scalar_fid_positions: List[int],
+        hist_dense_dim: int,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        history_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.history_dropout = history_dropout
+
+        # Resolve shared embedding refs for the 7 scalar fids.
+        # We store nn.Embedding refs as PLAIN python attributes (not via
+        # nn.ModuleList) so they remain owned exclusively by user_ns_tokenizer
+        # and are not double-counted in state_dict / param iteration.
+        emb_refs: List[Optional[nn.Embedding]] = []
+        emb_dims: List[int] = []
+        fallback_dim = int(user_ns_tokenizer.emb_dim)
+        for pos in scalar_fid_positions:
+            real_idx = user_ns_tokenizer._emb_index[pos]
+            if real_idx == -1:
+                emb_refs.append(None)
+                emb_dims.append(fallback_dim)
+            else:
+                e = user_ns_tokenizer.embs[real_idx]
+                emb_refs.append(e)
+                emb_dims.append(e.embedding_dim)
+        # Plain attrs — torch.nn.Module.__setattr__ would register
+        # nn.Embedding as submodule, which is exactly what we want to avoid.
+        # Wrap in tuple so the assignment goes through object.__setattr__ via
+        # _shared_emb_refs (lists of Modules also get registered). Workaround:
+        # store as a regular attribute keyed by name.
+        object.__setattr__(self, "_shared_emb_refs", tuple(emb_refs))
+        self._scalar_emb_dims = emb_dims
+        self._fallback_dim = fallback_dim
+
+        scalar_total_dim = sum(emb_dims)
+
+        # Private dense_61 projection (fresh params, not shared)
+        self.dense_proj = nn.Sequential(
+            nn.Linear(hist_dense_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        # Per-user token projection: (scalar_emb_cat | dense_proj) → d_model
+        self.token_proj = nn.Sequential(
+            nn.Linear(scalar_total_dim + d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        # Cross-attention modules — independent params for pos vs neg pool
+        self.pos_attn = CrossAttention(
+            d_model=d_model, num_heads=num_heads, dropout=dropout, ln_mode="pre"
+        )
+        self.neg_attn = CrossAttention(
+            d_model=d_model, num_heads=num_heads, dropout=dropout, ln_mode="pre"
+        )
+
+        # Learnable cold-pool fallback tokens (one per pool)
+        self.empty_pos = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.empty_neg = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+        # Fusion: gate input is [pos, neg] (2D) — deliberately excludes the
+        # baseline output so the gate cannot collapse into a copy of it; the
+        # add-on path stays a small, controllable correction.
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid(),
+        )
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def encode_hist_users(
+        self, hist_scalars: torch.Tensor, hist_dense: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode K historical users per sample → (B, K, d_model) tokens.
+
+        ``hist_scalars``: (B, K, 7) int64
+        ``hist_dense``:   (B, K, 256) float
+        """
+        B, K, n_fids = hist_scalars.shape
+        emb_refs = self._shared_emb_refs
+
+        # Scalar embeddings — flat across (B*K) for fewer kernel launches
+        flat = hist_scalars.reshape(B * K, n_fids).long()
+        per_feat: List[torch.Tensor] = []
+        for j in range(n_fids):
+            emb = emb_refs[j]
+            if emb is None:
+                per_feat.append(flat.new_zeros(
+                    B * K, self._fallback_dim, dtype=torch.float
+                ))
+            else:
+                per_feat.append(emb(flat[:, j]))
+        scalar_emb = torch.cat(per_feat, dim=-1)              # (B*K, scalar_dim)
+        scalar_emb = scalar_emb.view(B, K, -1)
+
+        # Dense projection
+        dense_emb = self.dense_proj(hist_dense)               # (B, K, D)
+
+        # Combine to one token per user
+        tok = torch.cat([scalar_emb, dense_emb], dim=-1)
+        tok = self.token_proj(tok)                            # (B, K, D)
+        return tok
+
+    def _cross_attend_with_fallback(
+        self,
+        query: torch.Tensor,           # (B, 1, D)
+        kv: torch.Tensor,              # (B, K, D)
+        kv_lens: torch.Tensor,         # (B,)
+        empty_token: torch.Tensor,     # (1, 1, D)
+        attn: nn.Module,
+        is_dropped: torch.Tensor,      # (B,) bool
+    ) -> torch.Tensor:
+        """Run cross-attention with a key_padding_mask built from ``kv_lens``,
+        then OVERWRITE the output of rows whose pool is empty or whose history
+        was dropped this step — using the learnable ``empty_token``.
+
+        The overwrite happens after the attention so we don't need to special-
+        case all-padding softmax: the masked attention's ``nan_to_num`` in
+        ``RoPEMultiheadAttention`` keeps activations finite.
+        """
+        B, K, D = kv.shape
+        device = kv.device
+        idx = torch.arange(K, device=device).unsqueeze(0)             # (1, K)
+        pad_mask = idx >= kv_lens.to(device=device).unsqueeze(1)      # (B, K)
+
+        # All-padding rows would make softmax NaN inside attention; flip the
+        # first slot to non-pad just for numerical safety. We'll overwrite the
+        # output anyway via ``use_empty``, so this leak is harmless.
+        pool_empty = (kv_lens == 0)
+        use_empty = pool_empty | is_dropped                            # (B,)
+        if use_empty.any():
+            first_slot = use_empty.unsqueeze(1) & (idx == 0)
+            pad_mask = pad_mask & ~first_slot
+
+        out = attn(query, kv, key_padding_mask=pad_mask)              # (B,1,D)
+
+        out = torch.where(
+            use_empty.view(B, 1, 1),
+            empty_token.expand(B, 1, D),
+            out,
+        )
+        return out  # (B, 1, D)
+
+    def forward(
+        self,
+        user_query: torch.Tensor,          # (B, 1, D), from UserQueryPool
+        hist_pos_scalars: torch.Tensor,
+        hist_pos_dense: torch.Tensor,
+        hist_pos_lens: torch.Tensor,
+        hist_neg_scalars: torch.Tensor,
+        hist_neg_dense: torch.Tensor,
+        hist_neg_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the fusion delta ``(B, d_model)`` to be gated-added to the
+        baseline HyFormer output. Caller is responsible for applying the gate.
+        """
+        B = user_query.size(0)
+        device = user_query.device
+
+        # History dropout (training-time only, applied per-row)
+        if self.training and self.history_dropout > 0:
+            is_dropped = (
+                torch.rand(B, device=device) < self.history_dropout
+            )
+        else:
+            is_dropped = torch.zeros(B, dtype=torch.bool, device=device)
+
+        # Encode K historical users → K tokens per pool
+        pos_kv = self.encode_hist_users(hist_pos_scalars, hist_pos_dense)
+        neg_kv = self.encode_hist_users(hist_neg_scalars, hist_neg_dense)
+
+        pos_out = self._cross_attend_with_fallback(
+            user_query, pos_kv, hist_pos_lens,
+            self.empty_pos, self.pos_attn, is_dropped,
+        )
+        neg_out = self._cross_attend_with_fallback(
+            user_query, neg_kv, hist_neg_lens,
+            self.empty_neg, self.neg_attn, is_dropped,
+        )
+
+        # Squeeze the singleton query axis and gate-fuse
+        pos_t = pos_out.squeeze(1)    # (B, D)
+        neg_t = neg_out.squeeze(1)
+        cat = torch.cat([pos_t, neg_t], dim=-1)   # (B, 2D)
+        gate = self.fusion_gate(cat)
+        delta = self.fusion_proj(cat)
+        return gate * delta                       # (B, D)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1482,6 +1745,20 @@ class PCVRHyFormer(nn.Module):
         # DIN: item_ns attends over each sequence domain before HyFormer blocks.
         # Updates item_ns in-place (residual), no change to num_ns or T.
         use_din: bool = False,
+        # ── Item-history-user (audience matching) module ──
+        # If ``enable_hist_users`` is True, the model builds a UserQueryPool +
+        # ItemHistUserModule that take per-row pos/neg user pools (pre-gathered
+        # by the dataset, see build_item_hist_users.py) and produce a gated
+        # delta added to the HyFormer output before the classifier.
+        enable_hist_users: bool = False,
+        # Positions of the 7 stable user scalar fids inside ``user_int_feature_specs``;
+        # required only when ``enable_hist_users=True``. The model uses these
+        # positions to BORROW the relevant Embedding tables from
+        # ``user_ns_tokenizer`` (shared weights, same semantic space).
+        hist_scalar_fid_positions: Optional[List[int]] = None,
+        hist_dense_dim: int = 256,
+        hist_dropout: float = 0.1,
+        hist_num_heads: Optional[int] = None,  # default = num_heads
     ) -> None:
         super().__init__()
 
@@ -1744,6 +2021,38 @@ class PCVRHyFormer(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(d_model, action_num),
         )
+
+        # ── Item-history-user module (optional add-on) ──
+        self.enable_hist_users = enable_hist_users
+        if enable_hist_users:
+            if hist_scalar_fid_positions is None:
+                raise ValueError(
+                    "enable_hist_users=True requires hist_scalar_fid_positions"
+                )
+            if ns_tokenizer_type != "rankmixer":
+                # GroupNSTokenizer uses a different _emb_index convention; we
+                # only support sharing from RankMixerNSTokenizer for now.
+                raise ValueError(
+                    "ItemHistUserModule currently shares embeddings only with "
+                    "RankMixerNSTokenizer; set ns_tokenizer_type='rankmixer'"
+                )
+            self.user_query_pool = UserQueryPool(
+                d_model=d_model,
+                num_heads=hist_num_heads or num_heads,
+                dropout=dropout_rate,
+            )
+            self.hist_user_module = ItemHistUserModule(
+                user_ns_tokenizer=self.user_ns_tokenizer,
+                scalar_fid_positions=hist_scalar_fid_positions,
+                hist_dense_dim=hist_dense_dim,
+                d_model=d_model,
+                num_heads=hist_num_heads or num_heads,
+                dropout=dropout_rate,
+                history_dropout=hist_dropout,
+            )
+        else:
+            self.user_query_pool = None
+            self.hist_user_module = None
 
         # Initialize parameters
         self._init_params()
@@ -2158,6 +2467,23 @@ class PCVRHyFormer(nn.Module):
         )
         self.last_seq_weights = seq_weights.detach()
 
+        # 4.5. Optional item-history-user fusion: pool the PRE-HyFormer user
+        # NS tokens to one query, cross-attend over the per-row pos/neg pools,
+        # then gate-add a small correction to the baseline output. The query
+        # is intentionally pre-HyFormer so Q and K/V share a pure-user space.
+        if self.hist_user_module is not None:
+            user_query = self.user_query_pool(user_ns)              # (B, 1, D)
+            hist_delta = self.hist_user_module(
+                user_query,
+                inputs.hist_pos_scalars,
+                inputs.hist_pos_dense,
+                inputs.hist_pos_lens,
+                inputs.hist_neg_scalars,
+                inputs.hist_neg_dense,
+                inputs.hist_neg_lens,
+            )                                                       # (B, D)
+            output = output + hist_delta
+
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         if return_output:
@@ -2225,6 +2551,19 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=False,
         )
         self.last_seq_weights = seq_weights.detach()
+
+        if self.hist_user_module is not None:
+            user_query = self.user_query_pool(user_ns)
+            hist_delta = self.hist_user_module(
+                user_query,
+                inputs.hist_pos_scalars,
+                inputs.hist_pos_dense,
+                inputs.hist_pos_lens,
+                inputs.hist_neg_scalars,
+                inputs.hist_neg_dense,
+                inputs.hist_neg_lens,
+            )
+            output = output + hist_delta
 
         logits = self.clsfier(output)
         return logits, output

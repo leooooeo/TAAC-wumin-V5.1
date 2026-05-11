@@ -315,6 +315,7 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         split_ts_threshold: Optional[int] = None,
         split_side: Optional[str] = None,
+        hist_users_dir: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -337,6 +338,17 @@ class PCVRParquetDataset(IterableDataset):
             split_side: ``'train'`` keeps rows with ``timestamp < split_ts_threshold``;
                 ``'valid'`` keeps ``timestamp >= split_ts_threshold``. Both must be
                 set together, or both omitted (no time-based row filter).
+            hist_users_dir: optional directory produced by
+                ``build_item_hist_users.py`` (see meta.json + *.npy inside). When
+                provided, every yielded batch carries six extra tensors used by
+                the model's ``ItemHistUserModule``:
+                ``hist_pos_scalars`` (B, k_pos, 7) int64,
+                ``hist_pos_dense``   (B, k_pos, 256) float32,
+                ``hist_neg_scalars`` (B, k_neg, 7) int64,
+                ``hist_neg_dense``   (B, k_neg, 256) float32,
+                ``hist_pos_lens`` / ``hist_neg_lens`` (B,) int32.
+                The directory must match ``parquet_path`` (same sorted basenames
+                and row-group counts); otherwise __init__ raises.
         """
         super().__init__()
 
@@ -380,11 +392,29 @@ class PCVRParquetDataset(IterableDataset):
             for i in range(pf.metadata.num_row_groups):
                 self._rg_list.append((f, i, pf.metadata.row_group(i).num_rows))
 
+        # Pre-compute global row-start offset for every (file, rg) BEFORE the
+        # row_group_range slice, so that train/valid splits (or any subset)
+        # still agree with the build_item_hist_users.py global indexing.
+        self._rg_global_offsets: Dict[Tuple[str, int], int] = {}
+        _cum = 0
+        for f, i, n in self._rg_list:
+            self._rg_global_offsets[(os.path.basename(f), i)] = _cum
+            _cum += n
+        self._total_rows_unfiltered = _cum
+
         if row_group_range is not None:
             start, end = row_group_range
             self._rg_list = self._rg_list[start:end]
 
         self.num_rows = sum(r[2] for r in self._rg_list)
+
+        # Load item-history-user lookup tables (mmap'd) if a directory is given.
+        # If not, every emitted batch simply omits the six hist_* keys and the
+        # downstream model falls back to the baseline path.
+        self.hist_users_dir = hist_users_dir
+        self._hist_loaded = False
+        if hist_users_dir is not None:
+            self._load_hist_users(hist_users_dir)
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
@@ -621,6 +651,101 @@ class PCVRParquetDataset(IterableDataset):
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
 
+    def _load_hist_users(self, hist_users_dir: str) -> None:
+        """Memory-map the six per-row hist arrays produced by
+        ``build_item_hist_users.py`` and validate that ``meta.json`` matches
+        this dataset's parquet layout (sorted basenames + per-rg row counts).
+        """
+        meta_path = os.path.join(hist_users_dir, "meta.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"missing {meta_path}")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        # Cross-check (basename, rg_idx, num_rows) against this dataset's full
+        # row-group list (before any row_group_range slice).
+        meta_rg = {(e["file"], int(e["rg"])): (int(e["row_start"]), int(e["num_rows"]))
+                   for e in meta["rg_layout"]}
+        for (bn, rg_idx), base_off in self._rg_global_offsets.items():
+            if (bn, rg_idx) not in meta_rg:
+                raise ValueError(
+                    f"hist_users meta missing entry for ({bn}, rg={rg_idx}); "
+                    f"the hist directory was built on a different parquet set."
+                )
+            m_off, m_n = meta_rg[(bn, rg_idx)]
+            if m_off != base_off:
+                raise ValueError(
+                    f"hist_users meta offset mismatch for ({bn}, rg={rg_idx}): "
+                    f"meta={m_off}, dataset={base_off}. File ordering differs."
+                )
+
+        self.hist_k_pos = int(meta["k_pos"])
+        self.hist_k_neg = int(meta["k_neg"])
+        self.hist_dense_dim = int(meta["dense_dim"])
+        self.hist_total_rows = int(meta["total_rows"])
+
+        # mmap-load all six arrays (640MB+ in total; mmap keeps RSS small).
+        load_mm = lambda name: np.load(
+            os.path.join(hist_users_dir, name), mmap_mode="r"
+        )
+        self._hist_scalars = load_mm("user_lookup_scalars.npy")  # (N, 7) int32
+        self._hist_dense = load_mm("user_lookup_dense61.npy")    # (N, 256) f16
+        self._hist_pos_idx = load_mm("hist_pos_indices.npy")     # (N, kp) i32
+        self._hist_neg_idx = load_mm("hist_neg_indices.npy")     # (N, kn) i32
+        # lens are small; load fully (saves a mmap per-batch)
+        self._hist_pos_len = np.load(
+            os.path.join(hist_users_dir, "hist_pos_lens.npy")
+        )  # (N,) int8
+        self._hist_neg_len = np.load(
+            os.path.join(hist_users_dir, "hist_neg_lens.npy")
+        )
+
+        # Sanity shape checks
+        N = self.hist_total_rows
+        assert self._hist_scalars.shape == (N, 7), self._hist_scalars.shape
+        assert self._hist_dense.shape == (N, self.hist_dense_dim)
+        assert self._hist_pos_idx.shape == (N, self.hist_k_pos)
+        assert self._hist_neg_idx.shape == (N, self.hist_k_neg)
+
+        self._hist_loaded = True
+        logging.info(
+            f"hist_users loaded from {hist_users_dir}: N={N:,}, "
+            f"k_pos={self.hist_k_pos}, k_neg={self.hist_k_neg}, "
+            f"dense_dim={self.hist_dense_dim}"
+        )
+
+    def _gather_hist(self, global_start: int, B: int) -> Dict[str, torch.Tensor]:
+        """Gather the four hist tensors for a contiguous batch.
+
+        Padding rows in hist_*_idx (value -1) are mapped to row 0 in
+        user_lookup; the downstream attention uses ``hist_*_lens`` as a
+        key_padding_mask so the contents of padded slots never affect the
+        output.
+        """
+        end = global_start + B
+        pos_idx = self._hist_pos_idx[global_start:end]   # (B, k_pos)
+        neg_idx = self._hist_neg_idx[global_start:end]
+        # Replace -1 padding with 0 so fancy-indexing never raises;
+        # padding mask is built from lengths downstream.
+        pos_safe = np.where(pos_idx >= 0, pos_idx, 0).astype(np.int64)
+        neg_safe = np.where(neg_idx >= 0, neg_idx, 0).astype(np.int64)
+
+        pos_scalars = np.asarray(self._hist_scalars[pos_safe], dtype=np.int64)
+        pos_dense = np.asarray(self._hist_dense[pos_safe], dtype=np.float32)
+        neg_scalars = np.asarray(self._hist_scalars[neg_safe], dtype=np.int64)
+        neg_dense = np.asarray(self._hist_dense[neg_safe], dtype=np.float32)
+        pos_lens = self._hist_pos_len[global_start:end].astype(np.int32)
+        neg_lens = self._hist_neg_len[global_start:end].astype(np.int32)
+
+        return {
+            "hist_pos_scalars": torch.from_numpy(pos_scalars),
+            "hist_pos_dense": torch.from_numpy(pos_dense),
+            "hist_neg_scalars": torch.from_numpy(neg_scalars),
+            "hist_neg_dense": torch.from_numpy(neg_dense),
+            "hist_pos_lens": torch.from_numpy(pos_lens),
+            "hist_neg_lens": torch.from_numpy(neg_lens),
+        }
+
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
         return sum(
@@ -640,10 +765,22 @@ class PCVRParquetDataset(IterableDataset):
         buffer: List[Dict[str, Any]] = []
         for file_path, rg_idx, _ in rg_list:
             pf = pq.ParquetFile(file_path)
+            # base_offset_in_rg: where the next batch starts inside this rg
+            base_offset_in_rg = 0
+            if self._hist_loaded:
+                rg_global_base = self._rg_global_offsets[
+                    (os.path.basename(file_path), rg_idx)
+                ]
             for batch in pf.iter_batches(
                 batch_size=self.batch_size, row_groups=[rg_idx]
             ):
                 batch_dict = self._convert_batch(batch)
+                if self._hist_loaded:
+                    hist = self._gather_hist(
+                        rg_global_base + base_offset_in_rg, batch.num_rows
+                    )
+                    batch_dict.update(hist)
+                base_offset_in_rg += batch.num_rows
                 if self._split_ts_threshold is not None:
                     batch_dict = self._filter_batch_by_split_ts(batch_dict)
                     if batch_dict is None:
@@ -1127,6 +1264,7 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     split_mode: str = "row_group",
+    hist_users_dir: Optional[str] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -1213,6 +1351,7 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             split_ts_threshold=train_threshold,
             split_side="train",
+            hist_users_dir=hist_users_dir,
         )
 
         train_loader = DataLoader(
@@ -1234,6 +1373,7 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             split_ts_threshold=valid_ts_threshold,
             split_side="valid",
+            hist_users_dir=hist_users_dir,
         )
 
         valid_loader = DataLoader(
@@ -1283,6 +1423,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        hist_users_dir=hist_users_dir,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -1308,6 +1449,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        hist_users_dir=hist_users_dir,
     )
     valid_loader = DataLoader(
         valid_dataset,
