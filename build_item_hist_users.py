@@ -35,6 +35,7 @@ import time
 from typing import List, Tuple
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -50,6 +51,19 @@ def list_files(data_dir: str) -> List[str]:
     if not files:
         raise FileNotFoundError(f"no .parquet in {data_dir}")
     return files
+
+
+def _as_single_array(col: "pa.ChunkedArray | pa.Array") -> "pa.Array":
+    """Return a single Arrow Array regardless of whether ``col`` came in as a
+    ChunkedArray (from ``Table.column``) or as a plain Array (from
+    ``RecordBatch.column``). ``read_row_group`` returns a Table whose columns
+    are always ChunkedArrays, which is why this helper is needed.
+    """
+    if isinstance(col, pa.ChunkedArray):
+        if col.num_chunks == 1:
+            return col.chunk(0)
+        return pa.concat_arrays(col.chunks)
+    return col
 
 
 def read_pass1(
@@ -88,8 +102,10 @@ def read_pass1(
                 arr[arr < 0] = 0
                 out_scalars[offset:offset + B, j] = arr.astype(np.int32)
 
-            # dense_61: list<float> of length 256 per row (or null)
-            dcol = tbl.column(dense_col)
+            # dense_61: list<float> of length 256 per row (or null).
+            # Table.column returns a ChunkedArray; flatten to a single
+            # ListArray so .offsets / .values are addressable.
+            dcol = _as_single_array(tbl.column(dense_col))
             offs = dcol.offsets.to_numpy()
             vals = dcol.values.to_numpy().astype(np.float32, copy=False)
             for i in range(B):
