@@ -2472,6 +2472,13 @@ class PCVRHyFormer(nn.Module):
         # then gate-add a small correction to the baseline output. The query
         # is intentionally pre-HyFormer so Q and K/V share a pure-user space.
         if self.hist_user_module is not None:
+            if inputs.hist_pos_scalars is None:
+                raise ValueError(
+                    "Model was built with enable_hist_users=True but received "
+                    "ModelInput.hist_pos_scalars=None. The dataset must be "
+                    "constructed with hist_users_dir set to the same lookup "
+                    "directory the checkpoint was trained against."
+                )
             user_query = self.user_query_pool(user_ns)              # (B, 1, D)
             hist_delta = self.hist_user_module(
                 user_query,

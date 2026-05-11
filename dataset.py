@@ -662,10 +662,29 @@ class PCVRParquetDataset(IterableDataset):
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
-        # Cross-check (basename, rg_idx, num_rows) against this dataset's full
-        # row-group list (before any row_group_range slice).
+        # Cross-check (basename, rg_idx, row_start, num_rows) against this
+        # dataset's full row-group list (before any row_group_range slice).
+        # num_rows is the only field that catches the silent-collision case
+        # where two different parquet files share a basename and rg_idx but
+        # carry different content (offset may also happen to match).
         meta_rg = {(e["file"], int(e["rg"])): (int(e["row_start"]), int(e["num_rows"]))
                    for e in meta["rg_layout"]}
+        # Re-derive per-rg row counts from the dataset side (matches the full
+        # list built in __init__ BEFORE row_group_range slicing).
+        all_rg_counts = {}
+        _cum = 0
+        for (bn, rg_idx), off in self._rg_global_offsets.items():
+            all_rg_counts[(bn, rg_idx)] = off  # placeholder; filled below
+        # We don't have the per-rg num_rows handy; recompute from _rg_global_offsets
+        # by deriving deltas. The dict isn't ordered for free, so sort by offset.
+        sorted_items = sorted(self._rg_global_offsets.items(), key=lambda kv: kv[1])
+        for i, (key, off) in enumerate(sorted_items):
+            next_off = (
+                sorted_items[i + 1][1] if i + 1 < len(sorted_items)
+                else self._total_rows_unfiltered
+            )
+            all_rg_counts[key] = next_off - off
+
         for (bn, rg_idx), base_off in self._rg_global_offsets.items():
             if (bn, rg_idx) not in meta_rg:
                 raise ValueError(
@@ -677,6 +696,13 @@ class PCVRParquetDataset(IterableDataset):
                 raise ValueError(
                     f"hist_users meta offset mismatch for ({bn}, rg={rg_idx}): "
                     f"meta={m_off}, dataset={base_off}. File ordering differs."
+                )
+            ds_n = all_rg_counts[(bn, rg_idx)]
+            if m_n != ds_n:
+                raise ValueError(
+                    f"hist_users meta row-count mismatch for ({bn}, rg={rg_idx}): "
+                    f"meta={m_n}, dataset={ds_n}. The parquet file changed under "
+                    f"the same basename, or two different files share a basename."
                 )
 
         self.hist_k_pos = int(meta["k_pos"])
