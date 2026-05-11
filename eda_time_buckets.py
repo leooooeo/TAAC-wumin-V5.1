@@ -96,7 +96,9 @@ def _collect_time_diffs(
                 ts_col_name = meta["ts_col"]
                 if ts_col_name not in schema_names:
                     continue
-                col = tbl.column(ts_col_name)
+                # ``tbl.column(...)`` returns a ChunkedArray; collapse to a single
+                # ListArray so we can read ``.offsets`` / ``.values`` directly.
+                col = tbl.column(ts_col_name).combine_chunks()
                 offsets = col.offsets.to_numpy()
                 values = col.values.to_numpy().astype(np.int64)
                 # Expand each row's event timestamps and broadcast sample_ts.
