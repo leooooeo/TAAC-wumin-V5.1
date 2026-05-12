@@ -5,11 +5,12 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 VALID_RATIO=0.1
 
 # ---- Item-history-user (audience matching) add-on ----
-# Tag identifies a specific build of the hist lookup tables (k_pos / k_neg /
-# time_gap / seed). Bump it whenever those change so train and infer pick up
-# the same artifacts. Output lives under $USER_CACHE_PATH so inference can
-# share it with training.
-HIST_TAG="${HIST_TAG:-kp16_kn32_g3600_v1}"
+# The item-keyed history table is data-only: it stores the full
+# per-interaction record (item_id, ts, label, user features) and the sampling
+# policy (k_pos / k_neg / time_gap) lives at runtime, not in the file. So a
+# single cache dir is reused across hyperparam sweeps. Output lives under
+# $USER_CACHE_PATH so inference can share it with training.
+HIST_TAG="${HIST_TAG:-v1}"
 HIST_K_POS=16
 HIST_K_NEG=32
 HIST_TIME_GAP=3600
@@ -47,10 +48,7 @@ if [ "$BUILD_ONLY" = true ] || [ ! -f "${HIST_USERS_DIR}/meta.json" ]; then
     echo "[run.sh] Building item-history-user lookup -> ${HIST_USERS_DIR}"
     if ! python3 -u "${SCRIPT_DIR}/build_item_hist_users.py" \
         --data_dir "${TRAIN_DATA_PATH}" \
-        --out_dir "${HIST_USERS_DIR}" \
-        --k_pos ${HIST_K_POS} \
-        --k_neg ${HIST_K_NEG} \
-        --time_gap ${HIST_TIME_GAP}; then
+        --out_dir "${HIST_USERS_DIR}"; then
         echo "[run.sh] build_item_hist_users.py FAILED — aborting before train"
         exit 1
     fi
@@ -87,6 +85,9 @@ if [ "$DEBUG_MODE" = true ]; then
         --schema_path "${SCRIPT_DIR}/schema.json" \
         --reinit_cardinality_threshold 999999 \
         --hist_users_dir "${HIST_USERS_DIR}" \
+        --hist_k_pos ${HIST_K_POS} \
+        --hist_k_neg ${HIST_K_NEG} \
+        --hist_time_gap ${HIST_TIME_GAP} \
         --hist_dropout ${HIST_DROPOUT} \
         "$@"
 else
@@ -109,6 +110,9 @@ else
         --emb_skip_threshold 1000000 \
         --dropout_rate 0.02 \
         --hist_users_dir "${HIST_USERS_DIR}" \
+        --hist_k_pos ${HIST_K_POS} \
+        --hist_k_neg ${HIST_K_NEG} \
+        --hist_time_gap ${HIST_TIME_GAP} \
         --hist_dropout ${HIST_DROPOUT} \
         "$@"
 fi

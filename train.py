@@ -393,9 +393,21 @@ def parse_args() -> argparse.Namespace:
         "--hist_users_dir",
         type=str,
         default=None,
-        help="Directory produced by build_item_hist_users.py (must contain "
-        "meta.json + the six *.npy arrays). If unset, the hist branch stays "
+        help="Directory produced by build_item_hist_users.py (item-keyed CSR "
+        "table: meta.json + 6 *.npy arrays). If unset, the hist branch stays "
         "disabled and the model behaves like the baseline.",
+    )
+    parser.add_argument(
+        "--hist_k_pos", type=int, default=16,
+        help="Per-row sample budget for the pos hist pool (label_type==2).",
+    )
+    parser.add_argument(
+        "--hist_k_neg", type=int, default=32,
+        help="Per-row sample budget for the neg hist pool (label_type==1).",
+    )
+    parser.add_argument(
+        "--hist_time_gap", type=int, default=3600,
+        help="Seconds; only history events with ts < cur_ts - gap are eligible.",
     )
     parser.add_argument(
         "--hist_dropout",
@@ -490,6 +502,9 @@ def main() -> None:
         seq_max_lens=seq_max_lens,
         split_mode=args.data_split,
         hist_users_dir=args.hist_users_dir,
+        hist_k_pos=args.hist_k_pos,
+        hist_k_neg=args.hist_k_neg,
+        hist_time_gap=args.hist_time_gap,
     )
 
     # ---- NS groups ----

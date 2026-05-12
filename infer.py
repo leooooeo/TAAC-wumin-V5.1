@@ -373,10 +373,17 @@ def main() -> None:
     data_dir = os.environ.get("EVAL_DATA_PATH")
     result_dir = os.environ.get("EVAL_RESULT_PATH")
     # Optional: directory produced by build_item_hist_users.py over the
-    # inference data (train + test parquets combined, so test rows can look
-    # up past train interactions). Required only if the checkpoint was trained
-    # with enable_hist_users=True; otherwise it is ignored.
+    # training data. The same file serves training and inference — test rows
+    # look up their item_id in it, and because test ts > all train ts the
+    # temporal cut at runtime trivially exposes the full training history.
+    # Required only if the checkpoint was trained with enable_hist_users=True;
+    # otherwise it is ignored.
     hist_users_dir = os.environ.get("EVAL_HIST_USERS_DIR")
+    # Sampling budget; default to "use everything" for inference so the test
+    # row sees as much training history per item as possible.
+    hist_k_pos = int(os.environ.get("EVAL_HIST_K_POS", "32"))
+    hist_k_neg = int(os.environ.get("EVAL_HIST_K_NEG", "64"))
+    hist_time_gap = int(os.environ.get("EVAL_HIST_TIME_GAP", "0"))
 
     os.makedirs(result_dir, exist_ok=True)
 
@@ -410,6 +417,9 @@ def main() -> None:
         buffer_batches=0,
         is_training=False,
         hist_users_dir=hist_users_dir,
+        hist_k_pos=hist_k_pos,
+        hist_k_neg=hist_k_neg,
+        hist_time_gap=hist_time_gap,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
