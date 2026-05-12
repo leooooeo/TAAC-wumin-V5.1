@@ -366,6 +366,35 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable DIN: item_ns attends over each sequence domain before HyFormer blocks.",
     )
+    # ── Item-history-user (audience matching) add-on ──
+    parser.add_argument(
+        "--hist_users_dir",
+        type=str,
+        default=None,
+        help="Directory produced by build_item_hist_users.py (item-keyed CSR "
+        "table: meta.json + 6 *.npy arrays). If unset, the hist branch stays "
+        "disabled and the model behaves like the baseline.",
+    )
+    parser.add_argument(
+        "--hist_k_pos", type=int, default=16,
+        help="Per-row sample budget for the pos hist pool (label_type==2).",
+    )
+    parser.add_argument(
+        "--hist_k_neg", type=int, default=32,
+        help="Per-row sample budget for the neg hist pool (label_type==1).",
+    )
+    parser.add_argument(
+        "--hist_time_gap", type=int, default=3600,
+        help="Seconds; only history events with ts < cur_ts - gap are eligible.",
+    )
+    parser.add_argument(
+        "--hist_dropout",
+        type=float,
+        default=0.1,
+        help="Probability of randomly zeroing the entire pos+neg hist pool for "
+        "a training row, forcing the empty-token fallback. Helps the model "
+        "stay accurate on items with no training history (cold inference rows).",
+    )
     parser.add_argument(
         "--user_ns_tokens",
         type=int,
@@ -450,6 +479,10 @@ def main() -> None:
         seed=args.seed,
         seq_max_lens=seq_max_lens,
         split_mode=args.data_split,
+        hist_users_dir=args.hist_users_dir,
+        hist_k_pos=args.hist_k_pos,
+        hist_k_neg=args.hist_k_neg,
+        hist_time_gap=args.hist_time_gap,
     )
 
     # ---- NS groups ----
@@ -525,6 +558,19 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "use_din": args.use_din,
+        # ── Item-history-user (bypass HyFormer) wiring ──
+        # Activated only when --hist_users_dir is provided. HistUserEncoder
+        # has its own independent params (mirror of backbone user encoding);
+        # see HistUserEncoder docstring for the design rationale.
+        **(
+            {
+                "enable_hist_users": True,
+                "hist_num_user_ns_tokens": args.user_ns_tokens or 12,
+                "hist_dropout": args.hist_dropout,
+            }
+            if args.hist_users_dir
+            else {}
+        ),
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

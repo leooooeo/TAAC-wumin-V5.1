@@ -1,14 +1,32 @@
-#!/bin/bas#!/bin/bash
+#!/bin/bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 VALID_RATIO=0.1
 
+# ---- Item-history-user (audience matching) add-on ----
+# The item-keyed history table is data-only: it stores the full
+# per-interaction record (item_id, ts, label, user features) and the sampling
+# policy (k_pos / k_neg / time_gap) lives at runtime, not in the file. So a
+# single cache dir is reused across hyperparam sweeps. Output lives under
+# $USER_CACHE_PATH so inference can share it with training.
+HIST_TAG="${HIST_TAG:-v1}"
+HIST_K_POS=16
+HIST_K_NEG=32
+HIST_TIME_GAP=3600
+HIST_DROPOUT=0.1
+
 # ---- Debug mode ----
 DEBUG_MODE=false
+BUILD_ONLY=false
 if [ "$1" = "debug" ]; then
     DEBUG_MODE=true
     echo "[run.sh] Running in DEBUG mode"
+    shift
+fi
+if [ "$1" = "build_hist" ]; then
+    BUILD_ONLY=true
+    echo "[run.sh] BUILD-ONLY mode: only build the item-history-user lookup"
     shift
 fi
 
@@ -19,9 +37,39 @@ if [ "$DEBUG_MODE" = true ]; then
     export TRAIN_TF_EVENTS_PATH="${SCRIPT_DIR}/../output/tf_events"
     export USER_CACHE_PATH="${SCRIPT_DIR}/../cache"
 
-    mkdir -p "$TRAIN_CKPT_PATH" "$TRAIN_LOG_PATH" "$TRAIN_TF_EVENTS_PATH"
+    mkdir -p "$TRAIN_CKPT_PATH" "$TRAIN_LOG_PATH" "$TRAIN_TF_EVENTS_PATH" "$USER_CACHE_PATH"
 fi
 
+# ---- Resolve hist lookup directory under USER_CACHE_PATH ----
+HIST_USERS_DIR="${USER_CACHE_PATH}/item_hist_${HIST_TAG}"
+
+# ---- Wipe USER_CACHE_PATH to keep under its 20GB quota. Everything in this
+# directory is regenerated downstream (currently the item-history table built
+# right below); previous experiments left behind several GB of stale .pkl
+# / .npy artifacts that nothing reads any more. The guard avoids the
+# catastrophic "rm -rf /*" pattern if USER_CACHE_PATH is unset. ----
+if [ -n "$USER_CACHE_PATH" ] && [ -d "$USER_CACHE_PATH" ]; then
+    echo "[run.sh] Wiping USER_CACHE_PATH=$USER_CACHE_PATH"
+    rm -rf -- "$USER_CACHE_PATH"/* "$USER_CACHE_PATH"/.[!.]* 2>/dev/null || true
+fi
+
+# ---- Build hist lookup (always — the script itself wipes + rewrites in ~15s,
+# which is negligible vs the risk of training against a stale schema). The
+# build script takes care of cleaning any orphan files before writing. ----
+echo "[run.sh] Building item-history-user lookup -> ${HIST_USERS_DIR}"
+if ! python3 -u "${SCRIPT_DIR}/build_item_hist_users.py" \
+    --data_dir "${TRAIN_DATA_PATH}" \
+    --out_dir "${HIST_USERS_DIR}"; then
+    echo "[run.sh] build_item_hist_users.py FAILED — aborting before train"
+    exit 1
+fi
+if [ ! -f "${HIST_USERS_DIR}/meta.json" ]; then
+    echo "[run.sh] build script returned 0 but meta.json is missing — aborting"
+    exit 1
+fi
+if [ "$BUILD_ONLY" = true ]; then
+    exit 0
+fi
 
 # 根据 DEBUG_MODE 设置不同的训练参数
 if [ "$DEBUG_MODE" = true ]; then
@@ -44,6 +92,11 @@ if [ "$DEBUG_MODE" = true ]; then
         --eval_every_n_steps 100 \
         --schema_path "${SCRIPT_DIR}/schema.json" \
         --reinit_cardinality_threshold 999999 \
+        --hist_users_dir "${HIST_USERS_DIR}" \
+        --hist_k_pos ${HIST_K_POS} \
+        --hist_k_neg ${HIST_K_NEG} \
+        --hist_time_gap ${HIST_TIME_GAP} \
+        --hist_dropout ${HIST_DROPOUT} \
         "$@"
 else
     # 正常模式参数
@@ -51,8 +104,8 @@ else
         --seed 7789 \
         --lr 1e-4 \
         --num_epochs 7 \
-        --num_workers 8 \
-        --buffer_batches 32 \
+        --num_workers 4 \
+        --buffer_batches 16 \
         --d_model 96 \
         --num_queries 2 \
         --num_hyformer_blocks 2 \
@@ -64,5 +117,10 @@ else
         --valid_ratio ${VALID_RATIO} \
         --emb_skip_threshold 1000000 \
         --dropout_rate 0.02 \
+        --hist_users_dir "${HIST_USERS_DIR}" \
+        --hist_k_pos ${HIST_K_POS} \
+        --hist_k_neg ${HIST_K_NEG} \
+        --hist_time_gap ${HIST_TIME_GAP} \
+        --hist_dropout ${HIST_DROPOUT} \
         "$@"
 fi

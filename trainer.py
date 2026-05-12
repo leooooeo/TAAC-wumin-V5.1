@@ -4,6 +4,7 @@ Despite the historical "Ranking" suffix in the class name, the training loop
 uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 """
 
+import math
 import os, time
 import glob
 import shutil
@@ -436,6 +437,12 @@ class PCVRHyFormerRankingTrainer:
                     if self.writer:
                         self.writer.add_scalar("AUC/valid", val_auc, total_step)
                         self.writer.add_scalar("LogLoss/valid", val_logloss, total_step)
+                        wa = getattr(self, "_last_warm_auc", None)
+                        ca = getattr(self, "_last_cold_auc", None)
+                        if wa is not None and not math.isnan(wa):
+                            self.writer.add_scalar("AUC/valid_warm", wa, total_step)
+                        if ca is not None and not math.isnan(ca):
+                            self.writer.add_scalar("AUC/valid_cold", ca, total_step)
 
                     self._handle_validation_result(total_step, val_auc, val_logloss)
 
@@ -458,6 +465,12 @@ class PCVRHyFormerRankingTrainer:
             if self.writer:
                 self.writer.add_scalar("AUC/valid", val_auc, total_step)
                 self.writer.add_scalar("LogLoss/valid", val_logloss, total_step)
+                wa = getattr(self, "_last_warm_auc", None)
+                ca = getattr(self, "_last_cold_auc", None)
+                if wa is not None and not math.isnan(wa):
+                    self.writer.add_scalar("AUC/valid_warm", wa, total_step)
+                if ca is not None and not math.isnan(ca):
+                    self.writer.add_scalar("AUC/valid_cold", ca, total_step)
 
             self._handle_validation_result(total_step, val_auc, val_logloss)
 
@@ -551,6 +564,20 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets=seq_time_buckets,
             seq_ts_float_feats=seq_ts_float_feats,
             seq_ts_stat_feats=seq_ts_stat_feats,
+            # Hist tensors are present only when the dataset was constructed
+            # with ``hist_users_dir`` AND the model was built with
+            # ``enable_hist_users=True``. Otherwise these stay None and the
+            # model's optional hist branch is skipped.
+            hist_pos_user_int=device_batch.get("hist_pos_user_int"),
+            hist_pos_user_dense=device_batch.get("hist_pos_user_dense"),
+            hist_pos_pair_int=device_batch.get("hist_pos_pair_int"),
+            hist_pos_pair_dense=device_batch.get("hist_pos_pair_dense"),
+            hist_neg_user_int=device_batch.get("hist_neg_user_int"),
+            hist_neg_user_dense=device_batch.get("hist_neg_user_dense"),
+            hist_neg_pair_int=device_batch.get("hist_neg_pair_int"),
+            hist_neg_pair_dense=device_batch.get("hist_neg_pair_dense"),
+            hist_pos_lens=device_batch.get("hist_pos_lens"),
+            hist_neg_lens=device_batch.get("hist_neg_lens"),
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> Tuple[float, torch.Tensor]:
@@ -619,12 +646,20 @@ class PCVRHyFormerRankingTrainer:
 
         all_logits_list = []
         all_labels_list = []
+        # has_hist_list[i] tracks whether this row had any hist (pos or neg);
+        # used to split AUC into warm/cold groups when the hist branch is on.
+        all_has_hist_list: list = []
 
         with torch.no_grad():
             for step, batch in pbar:
                 logits, labels = self._evaluate_step(batch)
                 all_logits_list.append(logits.detach().cpu())
                 all_labels_list.append(labels.detach().cpu())
+                # Read pos/neg lens straight from the CPU batch (avoid round-trip)
+                pl = batch.get("hist_pos_lens")
+                nl = batch.get("hist_neg_lens")
+                if pl is not None and nl is not None:
+                    all_has_hist_list.append(((pl > 0) | (nl > 0)))
 
         all_logits = torch.cat(all_logits_list, dim=0)
         all_labels = torch.cat(all_labels_list, dim=0).long()
@@ -643,6 +678,8 @@ class PCVRHyFormerRankingTrainer:
             valid_mask = ~nan_mask
             probs = probs[valid_mask]
             labels_np = labels_np[valid_mask]
+        else:
+            valid_mask = np.ones(len(probs), dtype=bool)
 
         if len(probs) == 0 or len(np.unique(labels_np)) < 2:
             auc = 0.0
@@ -658,6 +695,32 @@ class PCVRHyFormerRankingTrainer:
             ).item()
         else:
             logloss = float("inf")
+
+        # Warm / cold AUC split (only meaningful when hist branch is active).
+        # cold = both pos and neg pools were empty for this row.
+        if all_has_hist_list:
+            has_hist_np = torch.cat(all_has_hist_list, dim=0).numpy()
+            has_hist_np = has_hist_np[valid_mask]
+            n_warm = int(has_hist_np.sum())
+            n_cold = int((~has_hist_np).sum())
+            warm_auc = cold_auc = float("nan")
+            if n_warm > 0 and len(np.unique(labels_np[has_hist_np])) >= 2:
+                warm_auc = float(roc_auc_score(
+                    labels_np[has_hist_np], probs[has_hist_np]
+                ))
+            if n_cold > 0 and len(np.unique(labels_np[~has_hist_np])) >= 2:
+                cold_auc = float(roc_auc_score(
+                    labels_np[~has_hist_np], probs[~has_hist_np]
+                ))
+            logging.info(
+                f"[Evaluate] AUC overall={auc:.4f}  "
+                f"warm({n_warm})={warm_auc:.4f}  cold({n_cold})={cold_auc:.4f}  "
+                f"gap={warm_auc - cold_auc:+.4f}"
+            )
+            # Stash for caller (train loop) to write to TensorBoard with the
+            # correct global_step.
+            self._last_warm_auc = warm_auc
+            self._last_cold_auc = cold_auc
 
         return auc, logloss
 

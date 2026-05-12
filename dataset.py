@@ -315,6 +315,10 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         split_ts_threshold: Optional[int] = None,
         split_side: Optional[str] = None,
+        hist_users_dir: Optional[str] = None,
+        hist_k_pos: int = 16,
+        hist_k_neg: int = 32,
+        hist_time_gap: int = 3600,
     ) -> None:
         """
         Args:
@@ -337,6 +341,27 @@ class PCVRParquetDataset(IterableDataset):
             split_side: ``'train'`` keeps rows with ``timestamp < split_ts_threshold``;
                 ``'valid'`` keeps ``timestamp >= split_ts_threshold``. Both must be
                 set together, or both omitted (no time-based row filter).
+            hist_users_dir: optional directory produced by
+                ``build_item_hist_users.py`` (item-keyed CSR layout: see
+                meta.json + *.npy inside). When provided, every yielded batch
+                carries ten extra tensors used by the model's hist branch:
+                ``hist_pos_user_int``   (B, K_pos, user_int_total_dim)   int64,
+                ``hist_pos_user_dense`` (B, K_pos, user_dense_total_dim) float32,
+                ``hist_pos_pair_int``   (B, K_pos, pair_int_total_dim)   int64,
+                ``hist_pos_pair_dense`` (B, K_pos, pair_dense_total_dim) float32,
+                ``hist_neg_*``           (B, K_neg, ...) same four shapes,
+                ``hist_pos_lens`` / ``hist_neg_lens`` (B,) int32.
+                The file is shared by train and infer: each batch looks up its
+                rows' ``item_id`` and samples hist users with ``timestamp <
+                cur_ts - hist_time_gap``. Inference rows trivially see the
+                full training history because their ts exceeds all train ts.
+            hist_k_pos / hist_k_neg: per-row sample budget for the pos / neg
+                pool. Pools smaller than the budget are returned as-is and
+                padded; oversized pools are uniformly subsampled at runtime.
+            hist_time_gap: seconds; only history events with
+                ``ts < cur_ts - hist_time_gap`` are eligible. Set to 0 to
+                disable the temporal cut (e.g. at inference time, where the
+                full training history is wanted regardless).
         """
         super().__init__()
 
@@ -380,14 +405,43 @@ class PCVRParquetDataset(IterableDataset):
             for i in range(pf.metadata.num_row_groups):
                 self._rg_list.append((f, i, pf.metadata.row_group(i).num_rows))
 
+        # Pre-compute global row-start offset for every (file, rg) BEFORE the
+        # row_group_range slice, so that train/valid splits (or any subset)
+        # still agree with the build_item_hist_users.py global indexing.
+        self._rg_global_offsets: Dict[Tuple[str, int], int] = {}
+        _cum = 0
+        for f, i, n in self._rg_list:
+            self._rg_global_offsets[(os.path.basename(f), i)] = _cum
+            _cum += n
+        self._total_rows_unfiltered = _cum
+
         if row_group_range is not None:
             start, end = row_group_range
             self._rg_list = self._rg_list[start:end]
 
         self.num_rows = sum(r[2] for r in self._rg_list)
 
+        # Load item-history-user lookup tables (mmap'd) if a directory is given.
+        # If not, every emitted batch simply omits the six hist_* keys and the
+        # downstream model falls back to the baseline path.
+        self.hist_users_dir = hist_users_dir
+        self.hist_k_pos = int(hist_k_pos)
+        self.hist_k_neg = int(hist_k_neg)
+        self.hist_time_gap = int(hist_time_gap)
+        self._hist_loaded = False
+        self._hist_rng: Optional[np.random.Generator] = None
+        # Note: _load_hist_users is deferred until AFTER _load_schema so the
+        # hist meta-vs-live schema verification has access to user_int_schema
+        # etc.
+
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+
+        # Load hist lookup AFTER _load_schema (the loader cross-checks meta
+        # against user_int_schema / user_dense_schema / pair_int_schema /
+        # pair_dense_schema).
+        if hist_users_dir is not None:
+            self._load_hist_users(hist_users_dir)
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -621,6 +675,209 @@ class PCVRParquetDataset(IterableDataset):
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
 
+    def _load_hist_users(self, hist_users_dir: str) -> None:
+        """Load the item-keyed CSR history table produced by
+        ``build_item_hist_users.py``.
+
+        Layout:
+          item_ids.npy       (I,)                          int64
+          offsets.npy        (I+1,)                        int64
+          int_ts.npy         (M,)                          int32
+          int_label.npy      (M,)                          int8
+          int_user_int.npy   (M, user_int_total_dim)       int32
+          int_user_dense.npy (M, user_dense_total_dim)     float16
+          int_pair_int.npy   (M, pair_int_total_dim)       int32
+          int_pair_dense.npy (M, pair_dense_total_dim)     float16
+          meta.json with per-buffer schema entries (fid/vocab_size/length/offset).
+        """
+        meta_path = os.path.join(hist_users_dir, "meta.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"missing {meta_path}")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        # Verify the four schema-plan blocks match what the live dataset built
+        # from schema.json. If they don't, the hist arrays' columns won't line
+        # up with user_ns_tokenizer / cross_ns_tokenizer / _encode_user_dense.
+        def _verify(name: str, live_schema: FeatureSchema, live_vocab: Optional[List[int]]) -> None:
+            block = meta[name]
+            if int(block["total_dim"]) != int(live_schema.total_dim):
+                raise ValueError(
+                    f"hist meta {name}.total_dim={block['total_dim']} "
+                    f"!= dataset schema total_dim={live_schema.total_dim}. "
+                    f"Rebuild the hist directory against the current schema.json."
+                )
+            live_entries = list(live_schema.entries)  # (fid, offset, length)
+            if len(block["entries"]) != len(live_entries):
+                raise ValueError(
+                    f"hist meta {name} has {len(block['entries'])} entries, "
+                    f"dataset schema has {len(live_entries)}."
+                )
+            for i, e in enumerate(block["entries"]):
+                fid_live, off_live, len_live = live_entries[i]
+                if (int(e["fid"]) != int(fid_live)
+                        or int(e["offset"]) != int(off_live)
+                        or int(e["length"]) != int(len_live)):
+                    raise ValueError(
+                        f"hist meta {name}.entries[{i}]=(fid={e['fid']},"
+                        f"offset={e['offset']},length={e['length']}) "
+                        f"!= dataset entry (fid={fid_live},offset={off_live},"
+                        f"length={len_live})."
+                    )
+
+        _verify("user_int",   self.user_int_schema,   self.user_int_vocab_sizes)
+        _verify("pair_int",   self.pair_int_schema,   self.pair_int_vocab_sizes)
+        _verify("user_dense", self.user_dense_schema, None)
+        _verify("pair_dense", self.pair_dense_schema, None)
+
+        self.hist_user_int_dim   = int(meta["user_int"]["total_dim"])
+        self.hist_pair_int_dim   = int(meta["pair_int"]["total_dim"])
+        self.hist_user_dense_dim = int(meta["user_dense"]["total_dim"])
+        self.hist_pair_dense_dim = int(meta["pair_dense"]["total_dim"])
+
+        # Small arrays live fully in RAM (driving the per-row searchsorted).
+        self._hist_item_ids = np.load(os.path.join(hist_users_dir, "item_ids.npy"))
+        self._hist_offsets  = np.load(os.path.join(hist_users_dir, "offsets.npy"))
+        self._hist_ts       = np.load(os.path.join(hist_users_dir, "int_ts.npy"))
+        self._hist_label    = np.load(os.path.join(hist_users_dir, "int_label.npy"))
+
+        # Large user tables stay mmap'd to keep RSS small with many DataLoader workers.
+        load_mm = lambda name: np.load(os.path.join(hist_users_dir, name), mmap_mode="r")
+        self._hist_user_int   = load_mm("int_user_int.npy")
+        self._hist_user_dense = load_mm("int_user_dense.npy")
+        self._hist_pair_int   = load_mm("int_pair_int.npy")
+        self._hist_pair_dense = load_mm("int_pair_dense.npy")
+
+        M = self._hist_ts.shape[0]
+        assert self._hist_label.shape == (M,)
+        assert self._hist_user_int.shape   == (M, self.hist_user_int_dim)
+        assert self._hist_user_dense.shape == (M, self.hist_user_dense_dim)
+        assert self._hist_pair_int.shape   == (M, self.hist_pair_int_dim)
+        assert self._hist_pair_dense.shape == (M, self.hist_pair_dense_dim)
+
+        self._hist_loaded = True
+        logging.info(
+            f"hist_users loaded from {hist_users_dir}: items={len(self._hist_item_ids):,}, "
+            f"interactions={M:,}, "
+            f"user_int={self.hist_user_int_dim}, user_dense={self.hist_user_dense_dim}, "
+            f"pair_int={self.hist_pair_int_dim}, pair_dense={self.hist_pair_dense_dim}, "
+            f"k_pos={self.hist_k_pos}, k_neg={self.hist_k_neg}, "
+            f"time_gap={self.hist_time_gap}s"
+        )
+
+    def _rng(self) -> np.random.Generator:
+        """Lazy per-worker RNG. DataLoader forks workers AFTER __init__, so a
+        Generator created here picks up worker-local entropy."""
+        if self._hist_rng is None:
+            self._hist_rng = np.random.default_rng()
+        return self._hist_rng
+
+    def _gather_hist(
+        self,
+        item_ids: "npt.NDArray[np.int64]",
+        sample_ts: "npt.NDArray[np.int64]",
+    ) -> Dict[str, torch.Tensor]:
+        """Per-row online sampling of hist pos/neg users.
+
+        For each row (item_id, sample_ts):
+          1) locate the item's CSR slice (binary search on sorted item_ids);
+             rows with an unknown item_id yield empty pools.
+          2) within the slice, ``np.searchsorted(ts, cutoff)`` finds the
+             eligible prefix (ts < cutoff = sample_ts - time_gap).
+          3) split the eligible prefix by label_type into pos (==2) and
+             neg (==1) pools, then subsample uniformly to k_pos / k_neg.
+          4) gather the corresponding user scalars + dense via fancy
+             indexing on the mmap'd user tables.
+
+        Padding slots are filled with index 0 (any valid row); the downstream
+        attention sees ``hist_*_lens`` and masks them out.
+        """
+        B = item_ids.shape[0]
+        k_pos = self.hist_k_pos
+        k_neg = self.hist_k_neg
+
+        # Output buffers — written row-by-row, gathered at the end.
+        pos_rows = np.zeros((B, k_pos), dtype=np.int64)
+        neg_rows = np.zeros((B, k_neg), dtype=np.int64)
+        pos_lens = np.zeros(B, dtype=np.int32)
+        neg_lens = np.zeros(B, dtype=np.int32)
+
+        rng = self._rng()
+        item_ids_arr = self._hist_item_ids
+        offsets = self._hist_offsets
+        hist_ts = self._hist_ts
+        hist_label = self._hist_label
+        time_gap = self.hist_time_gap
+        I = item_ids_arr.shape[0]
+
+        # Vectorize the item-id lookup (still per-row sampling for the slice).
+        pos_in_item_arr = np.searchsorted(item_ids_arr, item_ids)
+        for i in range(B):
+            pos_in_item = int(pos_in_item_arr[i])
+            if pos_in_item >= I or item_ids_arr[pos_in_item] != item_ids[i]:
+                continue  # unknown item → both lens stay 0
+            start = int(offsets[pos_in_item])
+            end = int(offsets[pos_in_item + 1])
+            if end <= start:
+                continue
+
+            cutoff = int(sample_ts[i]) - time_gap
+            # ts is sorted ascending within the slice → searchsorted on the view.
+            eligible_end = start + int(
+                np.searchsorted(hist_ts[start:end], cutoff, side="left")
+            )
+            if eligible_end <= start:
+                continue
+
+            local_label = hist_label[start:eligible_end]
+            # Indices (into the global M arrays) of eligible pos / neg events.
+            pos_pool = start + np.flatnonzero(local_label == 2)
+            neg_pool = start + np.flatnonzero(local_label == 1)
+
+            if pos_pool.size > 0:
+                if pos_pool.size <= k_pos:
+                    chosen = pos_pool
+                else:
+                    chosen = rng.choice(pos_pool, size=k_pos, replace=False)
+                kk = chosen.size
+                pos_rows[i, :kk] = chosen
+                pos_lens[i] = kk
+
+            if neg_pool.size > 0:
+                if neg_pool.size <= k_neg:
+                    chosen = neg_pool
+                else:
+                    chosen = rng.choice(neg_pool, size=k_neg, replace=False)
+                kk = chosen.size
+                neg_rows[i, :kk] = chosen
+                neg_lens[i] = kk
+
+        # Fancy-index the four user-side tables. Padded slots (index 0) are
+        # masked downstream by hist_*_lens; their content doesn't matter as
+        # long as the embedding tables have padding_idx=0 for the int features.
+        def _gather(rows: np.ndarray) -> Dict[str, np.ndarray]:
+            return {
+                "user_int":   np.asarray(self._hist_user_int[rows],   dtype=np.int64),
+                "user_dense": np.asarray(self._hist_user_dense[rows], dtype=np.float32),
+                "pair_int":   np.asarray(self._hist_pair_int[rows],   dtype=np.int64),
+                "pair_dense": np.asarray(self._hist_pair_dense[rows], dtype=np.float32),
+            }
+
+        pos = _gather(pos_rows)
+        neg = _gather(neg_rows)
+        return {
+            "hist_pos_user_int":   torch.from_numpy(pos["user_int"]),
+            "hist_pos_user_dense": torch.from_numpy(pos["user_dense"]),
+            "hist_pos_pair_int":   torch.from_numpy(pos["pair_int"]),
+            "hist_pos_pair_dense": torch.from_numpy(pos["pair_dense"]),
+            "hist_neg_user_int":   torch.from_numpy(neg["user_int"]),
+            "hist_neg_user_dense": torch.from_numpy(neg["user_dense"]),
+            "hist_neg_pair_int":   torch.from_numpy(neg["pair_int"]),
+            "hist_neg_pair_dense": torch.from_numpy(neg["pair_dense"]),
+            "hist_pos_lens": torch.from_numpy(pos_lens),
+            "hist_neg_lens": torch.from_numpy(neg_lens),
+        }
+
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
         return sum(
@@ -644,6 +901,12 @@ class PCVRParquetDataset(IterableDataset):
                 batch_size=self.batch_size, row_groups=[rg_idx]
             ):
                 batch_dict = self._convert_batch(batch)
+                if self._hist_loaded:
+                    hist = self._gather_hist(
+                        batch_dict["item_id"].numpy(),
+                        batch_dict["timestamp"].numpy(),
+                    )
+                    batch_dict.update(hist)
                 if self._split_ts_threshold is not None:
                     batch_dict = self._filter_batch_by_split_ts(batch_dict)
                     if batch_dict is None:
@@ -819,6 +1082,10 @@ class PCVRParquetDataset(IterableDataset):
         else:
             labels = np.zeros(B, dtype=np.int64)
         user_ids = batch.column(self._col_idx["user_id"]).to_pylist()
+        item_id_arr = (
+            batch.column(self._col_idx["item_id"]).fill_null(0)
+            .to_numpy(zero_copy_only=False).astype(np.int64)
+        )
 
         # ---- user_int: write into pre-allocated buffer ----
         # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
@@ -917,6 +1184,8 @@ class PCVRParquetDataset(IterableDataset):
             "item_dense_feats": torch.from_numpy(item_dense.copy()),
             "label": torch.from_numpy(labels),
             "user_id": user_ids,
+            "item_id": torch.from_numpy(item_id_arr),
+            "timestamp": torch.from_numpy(timestamps.copy()),
             "_seq_domains": self.seq_domains,
         }
 
@@ -1127,6 +1396,10 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     split_mode: str = "row_group",
+    hist_users_dir: Optional[str] = None,
+    hist_k_pos: int = 16,
+    hist_k_neg: int = 32,
+    hist_time_gap: int = 3600,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -1168,7 +1441,7 @@ def get_pcvr_data(
     _train_kw: Dict[str, Any] = {}
     if num_workers > 0:
         _train_kw["persistent_workers"] = True
-        _train_kw["prefetch_factor"] = 4
+        _train_kw["prefetch_factor"] = 2
 
     split_mode_l = split_mode.strip().lower()
     if split_mode_l == "timestamp":
@@ -1213,6 +1486,10 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             split_ts_threshold=train_threshold,
             split_side="train",
+            hist_users_dir=hist_users_dir,
+            hist_k_pos=hist_k_pos,
+            hist_k_neg=hist_k_neg,
+            hist_time_gap=hist_time_gap,
         )
 
         train_loader = DataLoader(
@@ -1234,6 +1511,10 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             split_ts_threshold=valid_ts_threshold,
             split_side="valid",
+            hist_users_dir=hist_users_dir,
+            hist_k_pos=hist_k_pos,
+            hist_k_neg=hist_k_neg,
+            hist_time_gap=hist_time_gap,
         )
 
         valid_loader = DataLoader(
@@ -1283,13 +1564,17 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        hist_users_dir=hist_users_dir,
+        hist_k_pos=hist_k_pos,
+        hist_k_neg=hist_k_neg,
+        hist_time_gap=hist_time_gap,
     )
 
     use_cuda = torch.cuda.is_available()
     _train_kw = {}
     if num_workers > 0:
         _train_kw["persistent_workers"] = True
-        _train_kw["prefetch_factor"] = 4
+        _train_kw["prefetch_factor"] = 2
 
     train_loader = DataLoader(
         train_dataset,
@@ -1308,6 +1593,10 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        hist_users_dir=hist_users_dir,
+        hist_k_pos=hist_k_pos,
+        hist_k_neg=hist_k_neg,
+        hist_time_gap=hist_time_gap,
     )
     valid_loader = DataLoader(
         valid_dataset,

@@ -68,6 +68,11 @@ _FALLBACK_MODEL_CFG = {
     "user_ns_tokens": 0,
     "item_ns_tokens": 0,
     "use_din": False,
+    # ── Item-history-user is required at infer time. We don't include
+    # ``enable_hist_users`` in the fallback map because there is no "off" mode:
+    # main() asserts it and the model is always built with hist on.
+    "hist_num_user_ns_tokens": 12,
+    "hist_dropout": 0.1,
 }
 
 _FALLBACK_SEQ_MAX_LENS = "seq_a:256,seq_b:256,seq_c:512,seq_d:512"
@@ -230,6 +235,12 @@ def build_model(
         dataset.item_int_schema, dataset.item_int_vocab_sizes
     )
 
+    # The hist branch is mandatory at infer time. HistUserEncoder reads the
+    # FULL user-side schema (user_int + pair_int + user_dense + pair_dense)
+    # so no fid-position resolution is needed — the encoder mirrors the
+    # backbone tokenizers and consumes the same dataset buffers.
+    model_cfg = {**model_cfg, "enable_hist_users": True}
+
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
@@ -334,6 +345,16 @@ def _batch_to_model_input(
         seq_time_buckets=seq_time_buckets,
         seq_ts_float_feats=seq_ts_float_feats,
         seq_ts_stat_feats=seq_ts_stat_feats,
+        hist_pos_user_int=device_batch.get("hist_pos_user_int"),
+        hist_pos_user_dense=device_batch.get("hist_pos_user_dense"),
+        hist_pos_pair_int=device_batch.get("hist_pos_pair_int"),
+        hist_pos_pair_dense=device_batch.get("hist_pos_pair_dense"),
+        hist_neg_user_int=device_batch.get("hist_neg_user_int"),
+        hist_neg_user_dense=device_batch.get("hist_neg_user_dense"),
+        hist_neg_pair_int=device_batch.get("hist_neg_pair_int"),
+        hist_neg_pair_dense=device_batch.get("hist_neg_pair_dense"),
+        hist_pos_lens=device_batch.get("hist_pos_lens"),
+        hist_neg_lens=device_batch.get("hist_neg_lens"),
     )
 
 
@@ -342,6 +363,17 @@ def main() -> None:
     model_dir = os.environ.get("MODEL_OUTPUT_PATH")
     data_dir = os.environ.get("EVAL_DATA_PATH")
     result_dir = os.environ.get("EVAL_RESULT_PATH")
+    # Directory produced by build_item_hist_users.py over the training data.
+    # The same file serves training and inference — test rows look up their
+    # item_id in it, and because test ts > all train ts the temporal cut at
+    # runtime trivially exposes the full training history. REQUIRED.
+    hist_users_dir = os.environ.get("EVAL_HIST_USERS_DIR")
+    if not hist_users_dir:
+        raise ValueError(
+            "EVAL_HIST_USERS_DIR is not set. The hist branch is mandatory at "
+            "infer time; build the item-history table with build_item_hist_users.py "
+            "and point EVAL_HIST_USERS_DIR at its output directory."
+        )
 
     os.makedirs(result_dir, exist_ok=True)
 
@@ -356,6 +388,22 @@ def main() -> None:
 
     # ---- Load train_config.json (single source of truth for all hyperparams) ----
     train_config = load_train_config(model_dir)
+
+    # Sampling budget. Defaults inherit from train_config (and fall back to
+    # train.py's CLI defaults 16 / 32) so the cross-attention K-axis
+    # distribution at infer matches what the model saw during training; a
+    # different K would shift the softmax + padding-ratio + empty-token-
+    # frequency distribution that the model was fit to. Env vars override.
+    #
+    # time_gap=0 at infer (vs ~3600 at train) because every test ts is later
+    # than every training ts, so there is no leakage to gate against.
+    hist_k_pos = int(
+        os.environ.get("EVAL_HIST_K_POS", str(train_config.get("hist_k_pos", 16)))
+    )
+    hist_k_neg = int(
+        os.environ.get("EVAL_HIST_K_NEG", str(train_config.get("hist_k_neg", 32)))
+    )
+    hist_time_gap = int(os.environ.get("EVAL_HIST_TIME_GAP", "0"))
 
     # ---- Parse seq_max_lens ----
     sml_str = train_config.get("seq_max_lens", _FALLBACK_SEQ_MAX_LENS)
@@ -374,12 +422,22 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        hist_users_dir=hist_users_dir,
+        hist_k_pos=hist_k_pos,
+        hist_k_neg=hist_k_neg,
+        hist_time_gap=hist_time_gap,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
 
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
+
+    # dataset._load_hist_users already cross-checked each block's total_dim
+    # and per-fid entries against the live schema, so a stale/mismatched
+    # hist build raises there. Nothing extra to verify here — the model
+    # constructor will further fail at strict state_dict load if shapes
+    # disagree.
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the

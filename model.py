@@ -22,6 +22,27 @@ class ModelInput(NamedTuple):
     seq_time_buckets: dict  # {domain: tensor [B, L]}
     seq_ts_float_feats: dict  # {domain: tensor [B, 8, L]} float time-derived feats
     seq_ts_stat_feats: dict  # {domain: tensor [B, 6]} precomputed time stats
+    # Item-history-user pools (only populated when the hist branch is enabled
+    # and the dataset was built via build_item_hist_users.py). Each row gets two
+    # variable-length pools of past users that interacted with the same item:
+    #   pos pool: label_type==2 (converters)
+    #   neg pool: label_type==1 (shown but did not convert)
+    # ``hist_*_lens`` masks the K axis. None when the hist branch is disabled.
+    # Hist branch: per-row pool of historical users (one pool of converters
+    # = pos, one of shown-no-conv = neg). Each historical user is stored with
+    # the FULL user-side feature set (user_int + user_dense + pair_int +
+    # pair_dense), laid out identically to the live dataset's schemas so the
+    # hist encoder can mirror the backbone's user encoding path.
+    hist_pos_user_int:   Optional[torch.Tensor] = None   # (B, K_pos, user_int_dim)   int64
+    hist_pos_user_dense: Optional[torch.Tensor] = None   # (B, K_pos, user_dense_dim) float
+    hist_pos_pair_int:   Optional[torch.Tensor] = None   # (B, K_pos, pair_int_dim)   int64
+    hist_pos_pair_dense: Optional[torch.Tensor] = None   # (B, K_pos, pair_dense_dim) float
+    hist_neg_user_int:   Optional[torch.Tensor] = None
+    hist_neg_user_dense: Optional[torch.Tensor] = None
+    hist_neg_pair_int:   Optional[torch.Tensor] = None
+    hist_neg_pair_dense: Optional[torch.Tensor] = None
+    hist_pos_lens: Optional[torch.Tensor] = None         # (B,) int32
+    hist_neg_lens: Optional[torch.Tensor] = None         # (B,) int32
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1434,6 +1455,211 @@ class CrossRankMixerNSTokenizer(nn.Module):
         return torch.cat(outs, dim=-1)  # (B, out_dim)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hist user encoder + bypass HyFormer hist branch (audience matching)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class HistUserEncoder(nn.Module):
+    """Encode a user (or a batch of users) into a single (B, D) representation.
+
+    This module mirrors the backbone's user-side encoding stack — RankMixer
+    user_ns_tokenizer + CrossRankMixerNSTokenizer (pair features) +
+    _encode_user_dense — but owns its own copy of every parameter. Two design
+    choices follow from the M0 experiment finding that strict Q/K alignment
+    matters more than rich Q with poor K:
+
+    1) Q (current user) and K/V (historical users) go through the SAME forward
+       path of THIS module, so their outputs live in literally the same
+       embedding space and cross-attention dot products are meaningful.
+    2) Parameters are fully independent from the backbone tokenizer. This
+       isolates the gradient flow: hist sees 48 historical users per row
+       (K_pos + K_neg) vs backbone's 1 current user, so shared embeddings
+       would be dominated 48:1 by hist updates.
+
+    Pooling per user: mean-pool the ``num_user_ns_tokens`` NS tokens + the 2
+    user_dense tokens into a single (B, D) token. No learnable query pool
+    (user explicitly requested simplest path).
+    """
+
+    def __init__(
+        self,
+        user_int_feature_specs: List[Tuple[int, int, int]],
+        pair_int_feature_specs: List[Tuple[int, int, int]],
+        user_ns_groups: List[List[int]],
+        user_dense_dim: int,
+        user_emb_dim: int,
+        user_seq_block_dim: int,
+        user_seq_num: int,
+        d_model: int,
+        emb_dim: int,
+        num_user_ns_tokens: int,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.user_dense_dim = user_dense_dim
+        self._user_emb_dim = user_emb_dim
+        self._user_seq_block_dim = user_seq_block_dim
+        self._user_seq_num = user_seq_num
+
+        # --- pair feature encoder (independent copy) ---
+        # Only build if pair_int_feature_specs is non-empty; otherwise the
+        # backbone has nothing to inject either.
+        if len(pair_int_feature_specs) > 0:
+            self.cross_ns_tokenizer = CrossRankMixerNSTokenizer(
+                feature_specs=pair_int_feature_specs,
+                d_model=d_model,
+                emb_dim=emb_dim,
+            )
+            pair_emb_dim = self.cross_ns_tokenizer.out_dim
+        else:
+            self.cross_ns_tokenizer = None
+            pair_emb_dim = 0
+
+        # --- user_ns tokenizer (independent copy of RankMixerNSTokenizer) ---
+        self.user_ns_tokenizer = RankMixerNSTokenizer(
+            feature_specs=user_int_feature_specs,
+            groups=user_ns_groups,
+            emb_dim=emb_dim,
+            d_model=d_model,
+            num_ns_tokens=num_user_ns_tokens,
+            emb_skip_threshold=emb_skip_threshold,
+            extra_emb_dim=pair_emb_dim,
+        )
+
+        # --- user_dense encoder (independent copy of _encode_user_dense) ---
+        # Layout assumption matches PCVRHyFormer._encode_user_dense:
+        #   [0, user_emb_dim)                = dense_61
+        #   [user_emb_dim, user_emb_dim + user_seq_num*user_seq_block_dim)
+        #                                    = dense_87 (10 blocks of 32)
+        #   [..., end)                       = hod (0 dims in current schema)
+        _hod_dim = user_dense_dim - user_emb_dim - user_seq_block_dim * user_seq_num
+        if _hod_dim < 0:
+            raise ValueError(
+                f"HistUserEncoder: user_dense_dim ({user_dense_dim}) too small "
+                f"for user_emb_dim ({user_emb_dim}) + user_seq_num*block_dim "
+                f"({user_seq_num}*{user_seq_block_dim}={user_seq_num*user_seq_block_dim})."
+            )
+        self.user_emb_proj = nn.Sequential(
+            nn.Linear(user_emb_dim + _hod_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.user_seq_attn = nn.Linear(user_seq_block_dim, 1)
+        self.user_seq_proj = nn.Sequential(
+            nn.Linear(user_seq_block_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        # Cache: number of NS tokens we'll mean-pool. user_ns + 2 dense tokens.
+        self._n_tokens_for_pool = num_user_ns_tokens + 2
+
+    def _encode_user_dense_single(self, user_dense_feats: torch.Tensor) -> List[torch.Tensor]:
+        """Same logic as PCVRHyFormer._encode_user_dense but with this module's
+        own parameters. Returns a list of two (B, 1, D) tensors."""
+        B = user_dense_feats.size(0)
+        seq_start = self._user_emb_dim
+        seq_end = seq_start + self._user_seq_block_dim * self._user_seq_num
+
+        emb_input = torch.cat(
+            [user_dense_feats[:, :seq_start], user_dense_feats[:, seq_end:]], dim=-1
+        )
+        tok1 = F.silu(self.user_emb_proj(emb_input)).unsqueeze(1)         # (B, 1, D)
+
+        seq_vecs = user_dense_feats[:, seq_start:seq_end].view(
+            B, self._user_seq_num, self._user_seq_block_dim
+        )                                                                  # (B, N, block_dim)
+        valid = seq_vecs.norm(dim=-1) > 0.1                                # (B, N)
+        has_valid = valid.any(dim=-1, keepdim=True)
+        scores = self.user_seq_attn(seq_vecs).squeeze(-1)                  # (B, N)
+        scores = scores.masked_fill(~valid, float("-inf"))
+        scores = scores.masked_fill(~has_valid, 0.0)
+        attn = torch.softmax(scores, dim=-1)
+        seq_agg = (seq_vecs * attn.unsqueeze(-1)).sum(dim=1)               # (B, block_dim)
+        tok2 = F.silu(self.user_seq_proj(seq_agg)).unsqueeze(1)            # (B, 1, D)
+        return [tok1, tok2]
+
+    def encode_flat(
+        self,
+        user_int: torch.Tensor,         # (B, user_int_total_dim) int64
+        user_dense: torch.Tensor,       # (B, user_dense_total_dim) float
+        pair_int: torch.Tensor,         # (B, pair_int_total_dim) int64
+        pair_dense: torch.Tensor,       # (B, pair_dense_total_dim) float
+    ) -> torch.Tensor:
+        """Encode a flat batch of users → (B, D), mean-pooling the
+        user_ns + 2 dense tokens."""
+        if self.cross_ns_tokenizer is not None:
+            pair_emb = self.cross_ns_tokenizer(pair_int, pair_dense)       # (B, pair_emb_dim)
+        else:
+            pair_emb = None
+
+        user_ns = self.user_ns_tokenizer(user_int, extra_emb=pair_emb)     # (B, num_user_ns, D)
+        dense_toks = self._encode_user_dense_single(user_dense)             # 2 × (B, 1, D)
+        all_toks = torch.cat([user_ns] + dense_toks, dim=1)                # (B, num_user_ns + 2, D)
+        # Mean-pool over tokens — no learnable query pool (kept simple).
+        return all_toks.mean(dim=1)                                         # (B, D)
+
+    def forward(
+        self,
+        user_int: torch.Tensor,         # (B, ...) or (B, K, ...)
+        user_dense: torch.Tensor,
+        pair_int: torch.Tensor,
+        pair_dense: torch.Tensor,
+    ) -> torch.Tensor:
+        """Auto-detects batched (B, ...) vs (B, K, ...) input. Returns
+        (B, D) or (B, K, D)."""
+        if user_int.dim() == 2:
+            return self.encode_flat(user_int, user_dense, pair_int, pair_dense)
+        # (B, K, *) — flatten to (B*K, *), encode, reshape back.
+        B, K = user_int.size(0), user_int.size(1)
+        flat_user_int   = user_int.reshape(B * K, user_int.size(2))
+        flat_user_dense = user_dense.reshape(B * K, user_dense.size(2))
+        flat_pair_int   = pair_int.reshape(B * K, pair_int.size(2))
+        flat_pair_dense = pair_dense.reshape(B * K, pair_dense.size(2))
+        flat_out = self.encode_flat(flat_user_int, flat_user_dense, flat_pair_int, flat_pair_dense)
+        return flat_out.view(B, K, -1)
+
+
+class HistAttentionStack(nn.Module):
+    """Stack of cross-attention layers: Q (B, 1, D) attending over KV (B, K, D)
+    with padding mask. Same depth as the backbone HyFormer block stack so the
+    hist path has comparable representational capacity.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, num_layers: int, dropout: float) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                CrossAttention(
+                    d_model=d_model, num_heads=num_heads, dropout=dropout, ln_mode="pre"
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,            # (B, 1, D)
+        kv: torch.Tensor,               # (B, K, D)
+        kv_lens: torch.Tensor,          # (B,) int
+    ) -> torch.Tensor:
+        B, K, _ = kv.shape
+        device = kv.device
+        idx = torch.arange(K, device=device).unsqueeze(0)
+        pad_mask = idx >= kv_lens.to(device=device).unsqueeze(1)            # (B, K), True=padding
+        # Rows with completely empty pool: flip slot 0 to non-pad to avoid
+        # NaN softmax. Their final contribution is suppressed by the
+        # pre-HyFormer gate (zero scalar), not by attention.
+        all_pad = pad_mask.all(dim=1)
+        if all_pad.any():
+            first_unpad = all_pad.unsqueeze(1) & (idx == 0)
+            pad_mask = pad_mask & ~first_unpad
+        x = query
+        for layer in self.layers:
+            x = layer(x, kv, key_padding_mask=pad_mask)
+        return x                                                             # (B, 1, D)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1482,6 +1708,26 @@ class PCVRHyFormer(nn.Module):
         # DIN: item_ns attends over each sequence domain before HyFormer blocks.
         # Updates item_ns in-place (residual), no change to num_ns or T.
         use_din: bool = False,
+        # ── Item-history-user (audience matching) hist branch ──
+        # When ``enable_hist_users`` is True, the model builds a separate
+        # HistUserEncoder (independent params, mirror of backbone user
+        # encoding) and a per-pool cross-attention stack. Pos / neg pools
+        # produce two (B, D) representations that join the existing 4 seq
+        # domain reprs in a 6-way softmax merge inside _domain_sequence_gate.
+        # The hist branch is a BYPASS of HyFormer: hist Q does not interact
+        # with backbone Q tokens during the HyFormer block stack — this keeps
+        # backbone shape/T constraint untouched and isolates failure modes.
+        enable_hist_users: bool = False,
+        # Number of NS tokens the HistUserEncoder produces internally. Set to
+        # the same value as ``user_ns_tokens`` for parameter parity.
+        hist_num_user_ns_tokens: int = 12,
+        # Stochastic suppression of the hist branch during training, so the
+        # model stays robust to cold-pool inference rows.
+        hist_dropout: float = 0.1,
+        hist_num_heads: Optional[int] = None,  # default = num_heads
+        # Depth of hist cross-attention stack. Defaults to ``num_hyformer_blocks``
+        # so hist path has comparable depth to backbone.
+        hist_attn_num_layers: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -1745,6 +1991,81 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(d_model, action_num),
         )
 
+        # ── Hist branch: independent user encoder + cross-attention stack ──
+        # See HistUserEncoder docstring for design rationale (strict Q/K
+        # alignment via shared encoder, fully independent of backbone).
+        self.enable_hist_users = enable_hist_users
+        if enable_hist_users:
+            if not self.has_user_dense:
+                raise ValueError(
+                    "enable_hist_users=True requires user_dense_dim > 0 "
+                    "(hist branch needs to encode user_dense for both Q and K)."
+                )
+            hist_attn_layers = (
+                int(hist_attn_num_layers) if hist_attn_num_layers is not None
+                else int(num_hyformer_blocks)
+            )
+            self.hist_user_encoder = HistUserEncoder(
+                user_int_feature_specs=user_int_feature_specs,
+                pair_int_feature_specs=pair_int_feature_specs,
+                user_ns_groups=user_ns_groups,
+                user_dense_dim=user_dense_dim,
+                user_emb_dim=user_emb_dim,
+                user_seq_block_dim=user_seq_block_dim,
+                user_seq_num=user_seq_num,
+                d_model=d_model,
+                emb_dim=emb_dim,
+                num_user_ns_tokens=int(hist_num_user_ns_tokens),
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            hist_heads = hist_num_heads or num_heads
+            self.hist_pos_attn = HistAttentionStack(
+                d_model=d_model, num_heads=hist_heads,
+                num_layers=hist_attn_layers, dropout=dropout_rate,
+            )
+            self.hist_neg_attn = HistAttentionStack(
+                d_model=d_model, num_heads=hist_heads,
+                num_layers=hist_attn_layers, dropout=dropout_rate,
+            )
+            # Pre-HyFormer-gate input dims: 5 scalars
+            # [log_n_pos, log_n_neg, sim_pos, sim_neg, sim_pos - sim_neg].
+            # Gate is sigmoid scalar per pool; multiplies Q before it enters
+            # the 6-way softmax gate. Lets the model auto-suppress hist on
+            # empty / weak pools without burning softmax weight.
+            self.hist_pre_gate_pos = nn.Sequential(
+                nn.Linear(5, d_model // 2), nn.SiLU(), nn.Linear(d_model // 2, 1),
+            )
+            self.hist_pre_gate_neg = nn.Sequential(
+                nn.Linear(5, d_model // 2), nn.SiLU(), nn.Linear(d_model // 2, 1),
+            )
+            # Score MLPs for the 2 hist domains in _domain_sequence_gate (mirror
+            # of seq_gate_score / seq_gate_stat_proj for backbone seq domains).
+            # Input: [hist_repr (D), log_n (1), sim (1), gap (1)] = D + 3.
+            self.hist_pos_score = nn.Sequential(
+                nn.Linear(d_model + 3, d_model), nn.SiLU(), nn.Linear(d_model, 1),
+            )
+            self.hist_neg_score = nn.Sequential(
+                nn.Linear(d_model + 3, d_model), nn.SiLU(), nn.Linear(d_model, 1),
+            )
+            # Empty-pool learnable token: when both pools are empty (~17% of
+            # train rows by EDA), we still need to emit something for the
+            # 6-way merge — use a learned per-pool token, suppressed via the
+            # pre-gate, never NaN.
+            self.hist_empty_pos = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+            self.hist_empty_neg = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+            self.hist_dropout_prob = float(hist_dropout)
+        else:
+            self.hist_user_encoder = None
+            self.hist_pos_attn = None
+            self.hist_neg_attn = None
+            self.hist_pre_gate_pos = None
+            self.hist_pre_gate_neg = None
+            self.hist_pos_score = None
+            self.hist_neg_score = None
+            self.hist_empty_pos = None
+            self.hist_empty_neg = None
+            self.hist_dropout_prob = 0.0
+
         # Initialize parameters
         self._init_params()
 
@@ -1789,6 +2110,17 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        # HistUserEncoder owns its own embedding tables (no sharing with
+        # backbone). Initialise mirroring the backbone tokenizers above.
+        if self.hist_user_encoder is not None:
+            for emb in self.hist_user_encoder.user_ns_tokenizer.embs:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+            if self.hist_user_encoder.cross_ns_tokenizer is not None:
+                for emb in self.hist_user_encoder.cross_ns_tokenizer.embs:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1950,6 +2282,127 @@ class PCVRHyFormer(nn.Module):
 
         return [tok1, tok2]
 
+    def _compute_hist_extras(
+        self,
+        inputs: "ModelInput",
+        training: bool,
+    ) -> Optional[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        """Run the hist branch end-to-end and return the per-pool tuples
+        consumed by ``_domain_sequence_gate``.
+
+        Returns ``None`` if the hist branch is disabled or if the batch did
+        not carry hist tensors (training without --hist_users_dir).
+        """
+        if not self.enable_hist_users or self.hist_user_encoder is None:
+            return None
+        if inputs.hist_pos_user_int is None:
+            # The hist module was built but the batch lacks hist data — this
+            # is a contract violation between dataset and model.
+            raise ValueError(
+                "Model was built with enable_hist_users=True but the batch "
+                "is missing hist_pos_user_int (and likely the other hist "
+                "tensors). The dataset must be constructed with "
+                "hist_users_dir set to the same item-history directory the "
+                "checkpoint was trained against."
+            )
+
+        B = inputs.user_int_feats.size(0)
+        device = inputs.user_int_feats.device
+        dtype = inputs.user_dense_feats.dtype
+
+        # Encode current user (Q) and pos / neg pools (K/V) through the same
+        # independent encoder. Strict Q/K alignment.
+        q_user = self.hist_user_encoder(
+            inputs.user_int_feats,
+            inputs.user_dense_feats,
+            inputs.pair_int_feats,
+            inputs.pair_dense_feats,
+        )                                                                    # (B, D)
+        pos_kv = self.hist_user_encoder(
+            inputs.hist_pos_user_int.long(),
+            inputs.hist_pos_user_dense,
+            inputs.hist_pos_pair_int.long(),
+            inputs.hist_pos_pair_dense,
+        )                                                                    # (B, K_pos, D)
+        neg_kv = self.hist_user_encoder(
+            inputs.hist_neg_user_int.long(),
+            inputs.hist_neg_user_dense,
+            inputs.hist_neg_pair_int.long(),
+            inputs.hist_neg_pair_dense,
+        )                                                                    # (B, K_neg, D)
+
+        pos_lens = inputs.hist_pos_lens.to(device=device)
+        neg_lens = inputs.hist_neg_lens.to(device=device)
+
+        # Mean-pool valid hist users → (B, D) — used both for the pre-gate
+        # similarity computation and for the score MLP input.
+        def _masked_mean(kv: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+            K = kv.size(1)
+            idx = torch.arange(K, device=device).unsqueeze(0)
+            valid = (idx < lens.unsqueeze(1)).to(dtype=kv.dtype).unsqueeze(-1)  # (B, K, 1)
+            denom = valid.sum(dim=1).clamp(min=1.0)
+            return (kv * valid).sum(dim=1) / denom
+
+        pos_mean = _masked_mean(pos_kv, pos_lens)                            # (B, D)
+        neg_mean = _masked_mean(neg_kv, neg_lens)
+
+        scale = float(self.d_model) ** -0.5
+        sim_pos = (q_user * pos_mean).sum(-1, keepdim=True) * scale          # (B, 1)
+        sim_neg = (q_user * neg_mean).sum(-1, keepdim=True) * scale
+        gap     = sim_pos - sim_neg
+        log_n_pos = torch.log1p(pos_lens.to(dtype=dtype)).unsqueeze(-1)
+        log_n_neg = torch.log1p(neg_lens.to(dtype=dtype)).unsqueeze(-1)
+
+        # Pre-attention conditional gate over Q. Rows with empty pool /
+        # weak similarity learn to drive gate→0, leaving hist_repr ≈ empty
+        # token (suppressed). Multiplied onto Q before cross-attention.
+        gate_input = torch.cat(
+            [log_n_pos, log_n_neg, sim_pos, sim_neg, gap], dim=-1
+        )                                                                    # (B, 5)
+        pre_gate_pos = torch.sigmoid(self.hist_pre_gate_pos(gate_input))     # (B, 1)
+        pre_gate_neg = torch.sigmoid(self.hist_pre_gate_neg(gate_input))
+
+        # history_dropout: randomly suppress entire hist for a fraction of
+        # train rows so the model stays calibrated on cold-pool infer rows.
+        if training and self.hist_dropout_prob > 0:
+            keep = (torch.rand(B, 1, device=device) >= self.hist_dropout_prob).to(dtype=pre_gate_pos.dtype)
+            pre_gate_pos = pre_gate_pos * keep
+            pre_gate_neg = pre_gate_neg * keep
+
+        # Cross-attention stack — Q (B, 1, D) attends over (B, K, D).
+        q_pos = self.hist_pos_attn(
+            (q_user * pre_gate_pos).unsqueeze(1), pos_kv, pos_lens
+        ).squeeze(1)                                                          # (B, D)
+        q_neg = self.hist_neg_attn(
+            (q_user * pre_gate_neg).unsqueeze(1), neg_kv, neg_lens
+        ).squeeze(1)
+
+        # Cold-pool fallback: where the pool is fully empty, swap in the
+        # learnable empty token (which was also suppressed by pre_gate≈0
+        # via the training signal, so it stays small at infer too).
+        pool_empty_pos = (pos_lens == 0).view(B, 1)
+        pool_empty_neg = (neg_lens == 0).view(B, 1)
+        empty_pos = self.hist_empty_pos.expand(B, 1, -1).squeeze(1)
+        empty_neg = self.hist_empty_neg.expand(B, 1, -1).squeeze(1)
+        q_pos = torch.where(pool_empty_pos, empty_pos, q_pos)
+        q_neg = torch.where(pool_empty_neg, empty_neg, q_neg)
+
+        # Score MLPs feed [repr, log_n, sim, gap] → scalar, joining the
+        # 6-way softmax in _domain_sequence_gate.
+        pos_score_input = torch.cat([q_pos, log_n_pos, sim_pos, gap], dim=-1)
+        neg_score_input = torch.cat([q_neg, log_n_neg, sim_neg, gap], dim=-1)
+        pos_score = self.hist_pos_score(pos_score_input)                      # (B, 1)
+        neg_score = self.hist_neg_score(neg_score_input)
+
+        # Hist domains are always "valid" — the pre-gate + score MLP let the
+        # model attenuate the contribution to ~0 when appropriate. Always-valid
+        # avoids the softmax fully zeroing the row.
+        valid_all = torch.ones(B, dtype=torch.bool, device=device)
+        return [
+            (q_pos, pos_score, valid_all),
+            (q_neg, neg_score, valid_all),
+        ]
+
     def _time_bucket_pool(
         self,
         time_bucket_ids: torch.Tensor,
@@ -1977,8 +2430,15 @@ class PCVRHyFormer(nn.Module):
         seq_lens_list: list,
         seq_time_buckets_list: list,
         seq_ts_stat_feats_list: list,
+        hist_extras: Optional[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fuse domain-specific sequence representations with learned gates."""
+        """Fuse domain-specific sequence representations with learned gates.
+
+        ``hist_extras``, when provided, is a list of (repr, score, valid) tuples
+        — one per hist domain (pos, neg). Each tuple's ``repr`` is a (B, D)
+        tensor, ``score`` is (B, 1), ``valid`` is (B,) bool. They participate
+        in the softmax merge alongside the seq domains.
+        """
         seq_reprs = []
         scores = []
         valid_domains = []
@@ -2011,9 +2471,16 @@ class PCVRHyFormer(nn.Module):
             scores.append(score)
             valid_domains.append(valid_domain)
 
-        seq_repr_stack = torch.stack(seq_reprs, dim=1)  # (B, S, D)
-        scores_t = torch.cat(scores, dim=1)  # (B, S)
-        valid_mask = torch.stack(valid_domains, dim=1)  # (B, S)
+        # Append hist domains (pos / neg) if the hist branch fed them in.
+        if hist_extras is not None:
+            for repr_h, score_h, valid_h in hist_extras:
+                seq_reprs.append(repr_h.to(dtype=seq_reprs[0].dtype))
+                scores.append(score_h)
+                valid_domains.append(valid_h)
+
+        seq_repr_stack = torch.stack(seq_reprs, dim=1)  # (B, S+H, D)
+        scores_t = torch.cat(scores, dim=1)             # (B, S+H)
+        valid_mask = torch.stack(valid_domains, dim=1)  # (B, S+H)
         has_valid = valid_mask.any(dim=1, keepdim=True)
 
         masked_scores = scores_t.masked_fill(~valid_mask, float("-inf"))
@@ -2041,6 +2508,7 @@ class PCVRHyFormer(nn.Module):
         seq_time_buckets_list: list,
         seq_ts_stat_feats_list: list,
         apply_dropout: bool = True,
+        hist_extras: Optional[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs the block stack and fuses sequence Q tokens with domain gates."""
         if apply_dropout:
@@ -2082,6 +2550,7 @@ class PCVRHyFormer(nn.Module):
             seq_lens_list,
             seq_time_buckets_list,
             seq_ts_stat_feats_list,
+            hist_extras=hist_extras,
         )
 
     def forward(
@@ -2145,7 +2614,12 @@ class PCVRHyFormer(nn.Module):
             [inputs.seq_ts_stat_feats[d] for d in self.seq_domains],
         )
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
+        # 4.0 Hist branch (independent of HyFormer): encode current user and
+        # the pos / neg hist user pools, then produce two (B, D) reprs that
+        # join the 6-way softmax inside _domain_sequence_gate.
+        hist_extras = self._compute_hist_extras(inputs, training=self.training)
+
+        # 4. Dropout + MultiSeqHyFormerBlock stack + 6-way (or 4-way) gate
         output, seq_weights = self._run_multi_seq_blocks(
             q_tokens_list,
             ns_tokens,
@@ -2155,6 +2629,7 @@ class PCVRHyFormer(nn.Module):
             [inputs.seq_time_buckets[d] for d in self.seq_domains],
             [inputs.seq_ts_stat_feats[d] for d in self.seq_domains],
             apply_dropout=self.training,
+            hist_extras=hist_extras,
         )
         self.last_seq_weights = seq_weights.detach()
 
@@ -2214,6 +2689,7 @@ class PCVRHyFormer(nn.Module):
             [inputs.seq_ts_stat_feats[d] for d in self.seq_domains],
         )
 
+        hist_extras = self._compute_hist_extras(inputs, training=False)
         output, seq_weights = self._run_multi_seq_blocks(
             q_tokens_list,
             ns_tokens,
@@ -2223,6 +2699,7 @@ class PCVRHyFormer(nn.Module):
             [inputs.seq_time_buckets[d] for d in self.seq_domains],
             [inputs.seq_ts_stat_feats[d] for d in self.seq_domains],
             apply_dropout=False,
+            hist_extras=hist_extras,
         )
         self.last_seq_weights = seq_weights.detach()
 
