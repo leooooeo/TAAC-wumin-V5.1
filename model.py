@@ -1550,6 +1550,20 @@ class ItemHistUserModule(nn.Module):
         self.empty_pos = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.empty_neg = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
+        # Gated residual fusion: hist contribution is added on top of the
+        # backbone output, with a per-dim sigmoid gate so the model can
+        # shrink the add-on when hist is unreliable. Gate input is
+        # [pos_t, neg_t] only (no baseline output) so the gate can't collapse
+        # into a copy of the backbone signal.
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid(),
+        )
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+        )
+
     def encode_hist_users(
         self, hist_scalars: torch.Tensor, hist_dense: torch.Tensor
     ) -> torch.Tensor:
@@ -1620,13 +1634,13 @@ class ItemHistUserModule(nn.Module):
         hist_neg_scalars: torch.Tensor,
         hist_neg_dense: torch.Tensor,
         hist_neg_lens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the two pool reprs ``(pos_t, neg_t)``, each shape (B, D).
+    ) -> torch.Tensor:
+        """Return the gated-residual delta ``(B, d_model)`` to be added onto
+        the HyFormer output by the caller.
 
         Q (current user) and K/V (historical users) are encoded by the SAME
         ``encode_hist_users`` path, so the cross-attention dot products live
-        in literally one space. The caller is responsible for fusing the two
-        outputs into the backbone.
+        in one space.
         """
         B = current_scalars.size(0)
         device = current_scalars.device
@@ -1637,7 +1651,6 @@ class ItemHistUserModule(nn.Module):
             current_dense.unsqueeze(1),     # (B, 1, hist_dense_dim)
         )                                   # (B, 1, D)
 
-        # History dropout (training-time only, applied per-row)
         if self.training and self.history_dropout > 0:
             is_dropped = (
                 torch.rand(B, device=device) < self.history_dropout
@@ -1657,7 +1670,12 @@ class ItemHistUserModule(nn.Module):
             self.empty_neg, self.neg_attn, is_dropped,
         )
 
-        return pos_out.squeeze(1), neg_out.squeeze(1)
+        pos_t = pos_out.squeeze(1)                       # (B, D)
+        neg_t = neg_out.squeeze(1)
+        cat = torch.cat([pos_t, neg_t], dim=-1)          # (B, 2D)
+        gate = self.fusion_gate(cat)                     # (B, D)
+        delta = self.fusion_proj(cat)                    # (B, D)
+        return gate * delta                              # (B, D)
 
 
 class PCVRHyFormer(nn.Module):
@@ -2045,24 +2063,9 @@ class PCVRHyFormer(nn.Module):
                     f"user_emb_dim ({user_emb_dim}) to equal hist_dense_dim "
                     f"({hist_dense_dim}); current layout incompatible."
                 )
-            # Score MLPs for the 2 hist "virtual domains" inside
-            # _domain_sequence_gate's softmax. Mirrors seq_gate_score's role
-            # but takes only the pool repr (no ts_stat / time_pool here).
-            self.hist_score_pos = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.SiLU(),
-                nn.Linear(d_model, 1),
-            )
-            self.hist_score_neg = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.SiLU(),
-                nn.Linear(d_model, 1),
-            )
         else:
             self.user_query_pool = None
             self.hist_user_module = None
-            self.hist_score_pos = None
-            self.hist_score_neg = None
 
         # Initialize parameters
         self._init_params()
@@ -2303,18 +2306,8 @@ class PCVRHyFormer(nn.Module):
         seq_lens_list: list,
         seq_time_buckets_list: list,
         seq_ts_stat_feats_list: list,
-        hist_pos_repr: Optional[torch.Tensor] = None,
-        hist_neg_repr: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fuse domain-specific sequence reprs (and optionally the two
-        item-history-user pool reprs) via a single softmax-weighted sum.
-
-        When ``hist_pos_repr`` / ``hist_neg_repr`` are provided, they enter
-        the softmax as 2 extra "virtual domains" using ``hist_score_pos`` /
-        ``hist_score_neg`` for scoring. They are always considered valid
-        (the ItemHistUserModule already emits an ``empty_*`` learnable token
-        as the no-history fallback, so there is no "cold = invalid" case).
-        """
+        """Fuse domain-specific sequence representations with learned gates."""
         seq_reprs = []
         scores = []
         valid_domains = []
@@ -2347,21 +2340,9 @@ class PCVRHyFormer(nn.Module):
             scores.append(score)
             valid_domains.append(valid_domain)
 
-        # Append the 2 hist pool reprs as extra virtual domains (always valid)
-        if hist_pos_repr is not None and hist_neg_repr is not None:
-            for repr_t, scorer in (
-                (hist_pos_repr, self.hist_score_pos),
-                (hist_neg_repr, self.hist_score_neg),
-            ):
-                seq_reprs.append(repr_t)
-                scores.append(scorer(repr_t.to(dtype=repr_t.dtype)))
-                valid_domains.append(torch.ones(
-                    repr_t.size(0), dtype=torch.bool, device=repr_t.device,
-                ))
-
-        seq_repr_stack = torch.stack(seq_reprs, dim=1)  # (B, S[+2], D)
-        scores_t = torch.cat(scores, dim=1)             # (B, S[+2])
-        valid_mask = torch.stack(valid_domains, dim=1)  # (B, S[+2])
+        seq_repr_stack = torch.stack(seq_reprs, dim=1)  # (B, S, D)
+        scores_t = torch.cat(scores, dim=1)             # (B, S)
+        valid_mask = torch.stack(valid_domains, dim=1)  # (B, S)
         has_valid = valid_mask.any(dim=1, keepdim=True)
 
         masked_scores = scores_t.masked_fill(~valid_mask, float("-inf"))
@@ -2389,15 +2370,8 @@ class PCVRHyFormer(nn.Module):
         seq_time_buckets_list: list,
         seq_ts_stat_feats_list: list,
         apply_dropout: bool = True,
-        hist_pos_repr: Optional[torch.Tensor] = None,
-        hist_neg_repr: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Runs the block stack and fuses sequence Q tokens with domain gates.
-
-        ``hist_pos_repr`` / ``hist_neg_repr`` are forwarded to
-        ``_domain_sequence_gate`` as 2 extra virtual-domain reprs so that they
-        share the same softmax-weighted merge as the 4 sequence domains.
-        """
+        """Runs the block stack and fuses sequence Q tokens with domain gates."""
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
             ns_tokens = self.emb_dropout(ns_tokens)
@@ -2437,8 +2411,6 @@ class PCVRHyFormer(nn.Module):
             seq_lens_list,
             seq_time_buckets_list,
             seq_ts_stat_feats_list,
-            hist_pos_repr=hist_pos_repr,
-            hist_neg_repr=hist_neg_repr,
         )
 
     def forward(
@@ -2507,36 +2479,7 @@ class PCVRHyFormer(nn.Module):
         # and forward the two pool reprs into ``_run_multi_seq_blocks`` so
         # they participate in the same softmax-weighted merge as the 4 seq
         # domain reprs (6-way softmax instead of 4-way).
-        hist_pos_repr = None
-        hist_neg_repr = None
-        if self.hist_user_module is not None:
-            if inputs.hist_pos_scalars is None:
-                raise ValueError(
-                    "Model was built with enable_hist_users=True but received "
-                    "ModelInput.hist_pos_scalars=None. The dataset must be "
-                    "constructed with hist_users_dir set to the same lookup "
-                    "directory the checkpoint was trained against."
-                )
-            # Q/KV strict alignment: extract current user's same 7 scalar fids
-            # + dense_61 used by build_item_hist_users.py for historical users.
-            cur_scalars = inputs.user_int_feats.index_select(
-                1, self.hist_scalar_user_int_offsets
-            )                                                      # (B, n_fids)
-            cur_dense = inputs.user_dense_feats[
-                :, : self.hist_user_module.dense_proj[0].in_features
-            ]                                                       # (B, 256)
-            hist_pos_repr, hist_neg_repr = self.hist_user_module(
-                cur_scalars,
-                cur_dense,
-                inputs.hist_pos_scalars,
-                inputs.hist_pos_dense,
-                inputs.hist_pos_lens,
-                inputs.hist_neg_scalars,
-                inputs.hist_neg_dense,
-                inputs.hist_neg_lens,
-            )
-
-        # 4. Dropout + MultiSeqHyFormerBlock stack + softmax-merge
+        # 4. Dropout + MultiSeqHyFormerBlock stack + 4-way domain gate
         output, seq_weights = self._run_multi_seq_blocks(
             q_tokens_list,
             ns_tokens,
@@ -2546,10 +2489,38 @@ class PCVRHyFormer(nn.Module):
             [inputs.seq_time_buckets[d] for d in self.seq_domains],
             [inputs.seq_ts_stat_feats[d] for d in self.seq_domains],
             apply_dropout=self.training,
-            hist_pos_repr=hist_pos_repr,
-            hist_neg_repr=hist_neg_repr,
         )
         self.last_seq_weights = seq_weights.detach()
+
+        # 4.5 Optional item-history-user gated-residual fusion.
+        # Q (current user) and K/V (historical users) are encoded by the SAME
+        # encode_hist_users path, so they share an aligned space. The hist
+        # module returns a gated delta which is added on top of the backbone.
+        if self.hist_user_module is not None:
+            if inputs.hist_pos_scalars is None:
+                raise ValueError(
+                    "Model was built with enable_hist_users=True but received "
+                    "ModelInput.hist_pos_scalars=None. The dataset must be "
+                    "constructed with hist_users_dir set to the same lookup "
+                    "directory the checkpoint was trained against."
+                )
+            cur_scalars = inputs.user_int_feats.index_select(
+                1, self.hist_scalar_user_int_offsets
+            )
+            cur_dense = inputs.user_dense_feats[
+                :, : self.hist_user_module.dense_proj[0].in_features
+            ]
+            hist_delta = self.hist_user_module(
+                cur_scalars,
+                cur_dense,
+                inputs.hist_pos_scalars,
+                inputs.hist_pos_dense,
+                inputs.hist_pos_lens,
+                inputs.hist_neg_scalars,
+                inputs.hist_neg_dense,
+                inputs.hist_neg_lens,
+            )
+            output = output + hist_delta
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -2607,26 +2578,6 @@ class PCVRHyFormer(nn.Module):
             [inputs.seq_ts_stat_feats[d] for d in self.seq_domains],
         )
 
-        hist_pos_repr = None
-        hist_neg_repr = None
-        if self.hist_user_module is not None:
-            cur_scalars = inputs.user_int_feats.index_select(
-                1, self.hist_scalar_user_int_offsets
-            )
-            cur_dense = inputs.user_dense_feats[
-                :, : self.hist_user_module.dense_proj[0].in_features
-            ]
-            hist_pos_repr, hist_neg_repr = self.hist_user_module(
-                cur_scalars,
-                cur_dense,
-                inputs.hist_pos_scalars,
-                inputs.hist_pos_dense,
-                inputs.hist_pos_lens,
-                inputs.hist_neg_scalars,
-                inputs.hist_neg_dense,
-                inputs.hist_neg_lens,
-            )
-
         output, seq_weights = self._run_multi_seq_blocks(
             q_tokens_list,
             ns_tokens,
@@ -2636,10 +2587,27 @@ class PCVRHyFormer(nn.Module):
             [inputs.seq_time_buckets[d] for d in self.seq_domains],
             [inputs.seq_ts_stat_feats[d] for d in self.seq_domains],
             apply_dropout=False,
-            hist_pos_repr=hist_pos_repr,
-            hist_neg_repr=hist_neg_repr,
         )
         self.last_seq_weights = seq_weights.detach()
+
+        if self.hist_user_module is not None:
+            cur_scalars = inputs.user_int_feats.index_select(
+                1, self.hist_scalar_user_int_offsets
+            )
+            cur_dense = inputs.user_dense_feats[
+                :, : self.hist_user_module.dense_proj[0].in_features
+            ]
+            hist_delta = self.hist_user_module(
+                cur_scalars,
+                cur_dense,
+                inputs.hist_pos_scalars,
+                inputs.hist_pos_dense,
+                inputs.hist_pos_lens,
+                inputs.hist_neg_scalars,
+                inputs.hist_neg_dense,
+                inputs.hist_neg_lens,
+            )
+            output = output + hist_delta
 
         logits = self.clsfier(output)
         return logits, output
