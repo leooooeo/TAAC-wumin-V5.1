@@ -38,28 +38,6 @@ def build_feature_specs(
     return specs
 
 
-# Stable user scalar fids selected from EDA (present% ≥ 99.5%); matches the set
-# used by build_item_hist_users.py. Their index in user_int_schema.entries lets
-# ItemHistUserModule reuse the matching Embedding tables in user_ns_tokenizer.
-HIST_SCALAR_FIDS: List[int] = [1, 48, 49, 50, 51, 52, 53]
-
-
-def _resolve_hist_scalar_positions(user_int_schema: FeatureSchema) -> List[int]:
-    """Map each fid in ``HIST_SCALAR_FIDS`` to its index in
-    ``user_int_schema.entries``. Raises if any target fid is missing.
-    """
-    fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(user_int_schema.entries)}
-    positions: List[int] = []
-    for fid in HIST_SCALAR_FIDS:
-        if fid not in fid_to_idx:
-            raise ValueError(
-                f"hist scalar fid {fid} is not present in user_int_schema; "
-                "schema.json or HIST_SCALAR_FIDS need to be reconciled."
-            )
-        positions.append(fid_to_idx[fid])
-    return positions
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
 
@@ -580,18 +558,14 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "use_din": args.use_din,
-        # ── Item-history-user wiring ──
-        # Activate only when --hist_users_dir is provided. ``hist_scalar_fid_positions``
-        # maps the 7 stable scalar fids [1, 48..53] to their index inside
-        # ``user_int_schema.entries`` so the model can borrow the matching
-        # Embedding tables from user_ns_tokenizer.
+        # ── Item-history-user (bypass HyFormer) wiring ──
+        # Activated only when --hist_users_dir is provided. HistUserEncoder
+        # has its own independent params (mirror of backbone user encoding);
+        # see HistUserEncoder docstring for the design rationale.
         **(
             {
                 "enable_hist_users": True,
-                "hist_scalar_fid_positions": _resolve_hist_scalar_positions(
-                    pcvr_dataset.user_int_schema
-                ),
-                "hist_dense_dim": 256,
+                "hist_num_user_ns_tokens": args.user_ns_tokens or 12,
                 "hist_dropout": args.hist_dropout,
             }
             if args.hist_users_dir

@@ -71,7 +71,7 @@ _FALLBACK_MODEL_CFG = {
     # ── Item-history-user is required at infer time. We don't include
     # ``enable_hist_users`` in the fallback map because there is no "off" mode:
     # main() asserts it and the model is always built with hist on.
-    "hist_dense_dim": 256,
+    "hist_num_user_ns_tokens": 12,
     "hist_dropout": 0.1,
 }
 
@@ -235,22 +235,11 @@ def build_model(
         dataset.item_int_schema, dataset.item_int_vocab_sizes
     )
 
-    # The hist branch is mandatory at infer time. Resolve positions of the 7
-    # scalar fids in the live schema (the indices vary per schema, so they
-    # can't be cached in train_config).
-    hist_fids = [1, 48, 49, 50, 51, 52, 53]
-    fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)}
-    try:
-        model_cfg = {
-            **model_cfg,
-            "enable_hist_users": True,
-            "hist_scalar_fid_positions": [fid_to_idx[f] for f in hist_fids],
-        }
-    except KeyError as exc:
-        raise KeyError(
-            f"hist scalar fid {exc.args[0]} missing from schema; the "
-            f"checkpoint expects it for the hist branch."
-        ) from exc
+    # The hist branch is mandatory at infer time. HistUserEncoder reads the
+    # FULL user-side schema (user_int + pair_int + user_dense + pair_dense)
+    # so no fid-position resolution is needed — the encoder mirrors the
+    # backbone tokenizers and consumes the same dataset buffers.
+    model_cfg = {**model_cfg, "enable_hist_users": True}
 
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
@@ -356,10 +345,14 @@ def _batch_to_model_input(
         seq_time_buckets=seq_time_buckets,
         seq_ts_float_feats=seq_ts_float_feats,
         seq_ts_stat_feats=seq_ts_stat_feats,
-        hist_pos_scalars=device_batch.get("hist_pos_scalars"),
-        hist_pos_dense=device_batch.get("hist_pos_dense"),
-        hist_neg_scalars=device_batch.get("hist_neg_scalars"),
-        hist_neg_dense=device_batch.get("hist_neg_dense"),
+        hist_pos_user_int=device_batch.get("hist_pos_user_int"),
+        hist_pos_user_dense=device_batch.get("hist_pos_user_dense"),
+        hist_pos_pair_int=device_batch.get("hist_pos_pair_int"),
+        hist_pos_pair_dense=device_batch.get("hist_pos_pair_dense"),
+        hist_neg_user_int=device_batch.get("hist_neg_user_int"),
+        hist_neg_user_dense=device_batch.get("hist_neg_user_dense"),
+        hist_neg_pair_int=device_batch.get("hist_neg_pair_int"),
+        hist_neg_pair_dense=device_batch.get("hist_neg_pair_dense"),
         hist_pos_lens=device_batch.get("hist_pos_lens"),
         hist_neg_lens=device_batch.get("hist_neg_lens"),
     )
@@ -440,21 +433,11 @@ def main() -> None:
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
 
-    # Cross-check the hist file shape against what the checkpoint expects.
-    # A stale or mismatched hist build (e.g. different USER_DENSE_FID, or a
-    # different set of scalar fids) would otherwise surface as a shape error
-    # deep inside the model forward; catch it at the entry instead.
-    if test_dataset.hist_dense_dim != int(model_cfg["hist_dense_dim"]):
-        raise ValueError(
-            f"hist_users dir dense_dim={test_dataset.hist_dense_dim} "
-            f"does not match checkpoint hist_dense_dim={model_cfg['hist_dense_dim']}. "
-            f"Rebuild the item-history table against the same USER_DENSE_FID."
-        )
-    if test_dataset.hist_num_scalars != 7:
-        raise ValueError(
-            f"hist_users dir has {test_dataset.hist_num_scalars} scalar fids, "
-            f"but the checkpoint expects exactly 7."
-        )
+    # dataset._load_hist_users already cross-checked each block's total_dim
+    # and per-fid entries against the live schema, so a stale/mismatched
+    # hist build raises there. Nothing extra to verify here — the model
+    # constructor will further fail at strict state_dict load if shapes
+    # disagree.
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the

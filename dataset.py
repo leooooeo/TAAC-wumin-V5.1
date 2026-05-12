@@ -344,12 +344,12 @@ class PCVRParquetDataset(IterableDataset):
             hist_users_dir: optional directory produced by
                 ``build_item_hist_users.py`` (item-keyed CSR layout: see
                 meta.json + *.npy inside). When provided, every yielded batch
-                carries six extra tensors used by the model's
-                ``ItemHistUserModule``:
-                ``hist_pos_scalars`` (B, k_pos, 7) int64,
-                ``hist_pos_dense``   (B, k_pos, 256) float32,
-                ``hist_neg_scalars`` (B, k_neg, 7) int64,
-                ``hist_neg_dense``   (B, k_neg, 256) float32,
+                carries ten extra tensors used by the model's hist branch:
+                ``hist_pos_user_int``   (B, K_pos, user_int_total_dim)   int64,
+                ``hist_pos_user_dense`` (B, K_pos, user_dense_total_dim) float32,
+                ``hist_pos_pair_int``   (B, K_pos, pair_int_total_dim)   int64,
+                ``hist_pos_pair_dense`` (B, K_pos, pair_dense_total_dim) float32,
+                ``hist_neg_*``           (B, K_neg, ...) same four shapes,
                 ``hist_pos_lens`` / ``hist_neg_lens`` (B,) int32.
                 The file is shared by train and infer: each batch looks up its
                 rows' ``item_id`` and samples hist users with ``timestamp <
@@ -672,13 +672,16 @@ class PCVRParquetDataset(IterableDataset):
         """Load the item-keyed CSR history table produced by
         ``build_item_hist_users.py``.
 
-        Layout (see build_item_hist_users.py for details):
-          item_ids.npy       (I,)       int64  — sorted unique item ids
-          offsets.npy        (I+1,)     int64  — CSR offsets into the M arrays
-          int_ts.npy         (M,)       int32  — ts (ascending within each item)
-          int_label.npy      (M,)       int8   — label_type (1 or 2)
-          int_user_scalars   (M, 7)     int32  — 7 user scalars at event time
-          int_user_dense     (M, 256)   float16
+        Layout:
+          item_ids.npy       (I,)                          int64
+          offsets.npy        (I+1,)                        int64
+          int_ts.npy         (M,)                          int32
+          int_label.npy      (M,)                          int8
+          int_user_int.npy   (M, user_int_total_dim)       int32
+          int_user_dense.npy (M, user_dense_total_dim)     float16
+          int_pair_int.npy   (M, pair_int_total_dim)       int32
+          int_pair_dense.npy (M, pair_dense_total_dim)     float16
+          meta.json with per-buffer schema entries (fid/vocab_size/length/offset).
         """
         meta_path = os.path.join(hist_users_dir, "meta.json")
         if not os.path.isfile(meta_path):
@@ -686,35 +689,71 @@ class PCVRParquetDataset(IterableDataset):
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
-        self.hist_dense_dim = int(meta["dense_dim"])
-        self.hist_num_scalars = len(meta["scalar_fids"])
+        # Verify the four schema-plan blocks match what the live dataset built
+        # from schema.json. If they don't, the hist arrays' columns won't line
+        # up with user_ns_tokenizer / cross_ns_tokenizer / _encode_user_dense.
+        def _verify(name: str, live_schema: FeatureSchema, live_vocab: Optional[List[int]]) -> None:
+            block = meta[name]
+            if int(block["total_dim"]) != int(live_schema.total_dim):
+                raise ValueError(
+                    f"hist meta {name}.total_dim={block['total_dim']} "
+                    f"!= dataset schema total_dim={live_schema.total_dim}. "
+                    f"Rebuild the hist directory against the current schema.json."
+                )
+            live_entries = list(live_schema.entries)  # (fid, offset, length)
+            if len(block["entries"]) != len(live_entries):
+                raise ValueError(
+                    f"hist meta {name} has {len(block['entries'])} entries, "
+                    f"dataset schema has {len(live_entries)}."
+                )
+            for i, e in enumerate(block["entries"]):
+                fid_live, off_live, len_live = live_entries[i]
+                if (int(e["fid"]) != int(fid_live)
+                        or int(e["offset"]) != int(off_live)
+                        or int(e["length"]) != int(len_live)):
+                    raise ValueError(
+                        f"hist meta {name}.entries[{i}]=(fid={e['fid']},"
+                        f"offset={e['offset']},length={e['length']}) "
+                        f"!= dataset entry (fid={fid_live},offset={off_live},"
+                        f"length={len_live})."
+                    )
+
+        _verify("user_int",   self.user_int_schema,   self.user_int_vocab_sizes)
+        _verify("pair_int",   self.pair_int_schema,   self.pair_int_vocab_sizes)
+        _verify("user_dense", self.user_dense_schema, None)
+        _verify("pair_dense", self.pair_dense_schema, None)
+
+        self.hist_user_int_dim   = int(meta["user_int"]["total_dim"])
+        self.hist_pair_int_dim   = int(meta["pair_int"]["total_dim"])
+        self.hist_user_dense_dim = int(meta["user_dense"]["total_dim"])
+        self.hist_pair_dense_dim = int(meta["pair_dense"]["total_dim"])
 
         # Small arrays live fully in RAM (driving the per-row searchsorted).
-        self._hist_item_ids = np.load(
-            os.path.join(hist_users_dir, "item_ids.npy")
-        )                                                           # (I,) i64
-        self._hist_offsets = np.load(
-            os.path.join(hist_users_dir, "offsets.npy")
-        )                                                           # (I+1,) i64
-        self._hist_ts = np.load(os.path.join(hist_users_dir, "int_ts.npy"))    # (M,) i32
-        self._hist_label = np.load(os.path.join(hist_users_dir, "int_label.npy"))  # (M,) i8
+        self._hist_item_ids = np.load(os.path.join(hist_users_dir, "item_ids.npy"))
+        self._hist_offsets  = np.load(os.path.join(hist_users_dir, "offsets.npy"))
+        self._hist_ts       = np.load(os.path.join(hist_users_dir, "int_ts.npy"))
+        self._hist_label    = np.load(os.path.join(hist_users_dir, "int_label.npy"))
 
         # Large user tables stay mmap'd to keep RSS small with many DataLoader workers.
-        load_mm = lambda name: np.load(
-            os.path.join(hist_users_dir, name), mmap_mode="r"
-        )
-        self._hist_user_scalars = load_mm("int_user_scalars.npy")   # (M, 7) i32
-        self._hist_user_dense = load_mm("int_user_dense.npy")       # (M, 256) f16
+        load_mm = lambda name: np.load(os.path.join(hist_users_dir, name), mmap_mode="r")
+        self._hist_user_int   = load_mm("int_user_int.npy")
+        self._hist_user_dense = load_mm("int_user_dense.npy")
+        self._hist_pair_int   = load_mm("int_pair_int.npy")
+        self._hist_pair_dense = load_mm("int_pair_dense.npy")
 
         M = self._hist_ts.shape[0]
         assert self._hist_label.shape == (M,)
-        assert self._hist_user_scalars.shape[0] == M
-        assert self._hist_user_dense.shape == (M, self.hist_dense_dim)
+        assert self._hist_user_int.shape   == (M, self.hist_user_int_dim)
+        assert self._hist_user_dense.shape == (M, self.hist_user_dense_dim)
+        assert self._hist_pair_int.shape   == (M, self.hist_pair_int_dim)
+        assert self._hist_pair_dense.shape == (M, self.hist_pair_dense_dim)
 
         self._hist_loaded = True
         logging.info(
             f"hist_users loaded from {hist_users_dir}: items={len(self._hist_item_ids):,}, "
-            f"interactions={M:,}, dense_dim={self.hist_dense_dim}, "
+            f"interactions={M:,}, "
+            f"user_int={self.hist_user_int_dim}, user_dense={self.hist_user_dense_dim}, "
+            f"pair_int={self.hist_pair_int_dim}, pair_dense={self.hist_pair_dense_dim}, "
             f"k_pos={self.hist_k_pos}, k_neg={self.hist_k_neg}, "
             f"time_gap={self.hist_time_gap}s"
         )
@@ -749,8 +788,6 @@ class PCVRParquetDataset(IterableDataset):
         B = item_ids.shape[0]
         k_pos = self.hist_k_pos
         k_neg = self.hist_k_neg
-        D = self.hist_dense_dim
-        n_fids = self.hist_num_scalars
 
         # Output buffers — written row-by-row, gathered at the end.
         pos_rows = np.zeros((B, k_pos), dtype=np.int64)
@@ -808,25 +845,28 @@ class PCVRParquetDataset(IterableDataset):
                 neg_rows[i, :kk] = chosen
                 neg_lens[i] = kk
 
-        # Fancy-index user tables. Padded slots (index 0) are masked later.
-        pos_scalars = np.asarray(
-            self._hist_user_scalars[pos_rows], dtype=np.int64
-        )                                                # (B, k_pos, n_fids)
-        pos_dense = np.asarray(
-            self._hist_user_dense[pos_rows], dtype=np.float32
-        )                                                # (B, k_pos, D)
-        neg_scalars = np.asarray(
-            self._hist_user_scalars[neg_rows], dtype=np.int64
-        )
-        neg_dense = np.asarray(
-            self._hist_user_dense[neg_rows], dtype=np.float32
-        )
+        # Fancy-index the four user-side tables. Padded slots (index 0) are
+        # masked downstream by hist_*_lens; their content doesn't matter as
+        # long as the embedding tables have padding_idx=0 for the int features.
+        def _gather(rows: np.ndarray) -> Dict[str, np.ndarray]:
+            return {
+                "user_int":   np.asarray(self._hist_user_int[rows],   dtype=np.int64),
+                "user_dense": np.asarray(self._hist_user_dense[rows], dtype=np.float32),
+                "pair_int":   np.asarray(self._hist_pair_int[rows],   dtype=np.int64),
+                "pair_dense": np.asarray(self._hist_pair_dense[rows], dtype=np.float32),
+            }
 
+        pos = _gather(pos_rows)
+        neg = _gather(neg_rows)
         return {
-            "hist_pos_scalars": torch.from_numpy(pos_scalars),
-            "hist_pos_dense": torch.from_numpy(pos_dense),
-            "hist_neg_scalars": torch.from_numpy(neg_scalars),
-            "hist_neg_dense": torch.from_numpy(neg_dense),
+            "hist_pos_user_int":   torch.from_numpy(pos["user_int"]),
+            "hist_pos_user_dense": torch.from_numpy(pos["user_dense"]),
+            "hist_pos_pair_int":   torch.from_numpy(pos["pair_int"]),
+            "hist_pos_pair_dense": torch.from_numpy(pos["pair_dense"]),
+            "hist_neg_user_int":   torch.from_numpy(neg["user_int"]),
+            "hist_neg_user_dense": torch.from_numpy(neg["user_dense"]),
+            "hist_neg_pair_int":   torch.from_numpy(neg["pair_int"]),
+            "hist_neg_pair_dense": torch.from_numpy(neg["pair_dense"]),
             "hist_pos_lens": torch.from_numpy(pos_lens),
             "hist_neg_lens": torch.from_numpy(neg_lens),
         }
