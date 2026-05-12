@@ -569,11 +569,9 @@ class PCVRHyFormerRankingTrainer:
             # ``enable_hist_users=True``. Otherwise these stay None and the
             # model's optional hist branch is skipped.
             hist_pos_scalars=device_batch.get("hist_pos_scalars"),
-            hist_pos_dense61=device_batch.get("hist_pos_dense61"),
-            hist_pos_dense87=device_batch.get("hist_pos_dense87"),
+            hist_pos_dense=device_batch.get("hist_pos_dense"),
             hist_neg_scalars=device_batch.get("hist_neg_scalars"),
-            hist_neg_dense61=device_batch.get("hist_neg_dense61"),
-            hist_neg_dense87=device_batch.get("hist_neg_dense87"),
+            hist_neg_dense=device_batch.get("hist_neg_dense"),
             hist_pos_lens=device_batch.get("hist_pos_lens"),
             hist_neg_lens=device_batch.get("hist_neg_lens"),
         )

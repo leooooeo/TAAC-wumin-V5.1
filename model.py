@@ -28,12 +28,10 @@ class ModelInput(NamedTuple):
     #   pos pool: label_type==2 (converters)
     #   neg pool: label_type==1 (shown but did not convert)
     # ``hist_*_lens`` masks the K axis. None when the hist branch is disabled.
-    hist_pos_scalars: Optional[torch.Tensor] = None   # (B, K_pos, 12) int64
-    hist_pos_dense61: Optional[torch.Tensor] = None   # (B, K_pos, 256) float — user_dense_feats_61
-    hist_pos_dense87: Optional[torch.Tensor] = None   # (B, K_pos, 320) float — user_dense_feats_87
-    hist_neg_scalars: Optional[torch.Tensor] = None   # (B, K_neg, 12) int64
-    hist_neg_dense61: Optional[torch.Tensor] = None   # (B, K_neg, 256) float
-    hist_neg_dense87: Optional[torch.Tensor] = None   # (B, K_neg, 320) float
+    hist_pos_scalars: Optional[torch.Tensor] = None   # (B, K_pos, 7) int64
+    hist_pos_dense: Optional[torch.Tensor] = None     # (B, K_pos, 256) float
+    hist_neg_scalars: Optional[torch.Tensor] = None   # (B, K_neg, 7) int64
+    hist_neg_dense: Optional[torch.Tensor] = None     # (B, K_neg, 256) float
     hist_pos_lens: Optional[torch.Tensor] = None      # (B,) int32
     hist_neg_lens: Optional[torch.Tensor] = None      # (B,) int32
 
@@ -1504,8 +1502,7 @@ class ItemHistUserModule(nn.Module):
     def __init__(
         self,
         scalar_vocab_sizes: List[int],
-        hist_dense_dim_61: int,
-        hist_dense_dim_87: int,
+        hist_dense_dim: int,
         d_model: int,
         num_heads: int,
         emb_dim_base: int = 64,
@@ -1514,8 +1511,6 @@ class ItemHistUserModule(nn.Module):
     ) -> None:
         super().__init__()
         self.d_model = d_model
-        self.hist_dense_dim_61 = hist_dense_dim_61
-        self.hist_dense_dim_87 = hist_dense_dim_87
         self.history_dropout = history_dropout
 
         # Own scalar embedding tables (one per hist scalar fid). vocab_size+1
@@ -1531,21 +1526,15 @@ class ItemHistUserModule(nn.Module):
         self.scalar_emb_dims = emb_dims
         scalar_total_dim = sum(emb_dims)
 
-        # Independent dense projections for fid=61 (ID embedding) and fid=87
-        # (behavior-history embedding). Keeping them separate lets each head
-        # learn its own normalization without coupling the two semantic spaces.
-        self.dense_proj_61 = nn.Sequential(
-            nn.Linear(hist_dense_dim_61, d_model),
-            nn.LayerNorm(d_model),
-        )
-        self.dense_proj_87 = nn.Sequential(
-            nn.Linear(hist_dense_dim_87, d_model),
+        # Private dense_61 projection (fresh params)
+        self.dense_proj = nn.Sequential(
+            nn.Linear(hist_dense_dim, d_model),
             nn.LayerNorm(d_model),
         )
 
-        # Per-user token projection: (scalar_emb_cat | dense61 | dense87) → d_model
+        # Per-user token projection: (scalar_emb_cat | dense_proj) → d_model
         self.token_proj = nn.Sequential(
-            nn.Linear(scalar_total_dim + 2 * d_model, d_model),
+            nn.Linear(scalar_total_dim + d_model, d_model),
             nn.LayerNorm(d_model),
         )
 
@@ -1576,16 +1565,12 @@ class ItemHistUserModule(nn.Module):
         )
 
     def encode_hist_users(
-        self,
-        hist_scalars: torch.Tensor,
-        hist_dense_61: torch.Tensor,
-        hist_dense_87: torch.Tensor,
+        self, hist_scalars: torch.Tensor, hist_dense: torch.Tensor
     ) -> torch.Tensor:
         """Encode K historical users per sample → (B, K, d_model) tokens.
 
-        ``hist_scalars``:    (B, K, len(scalar_embs)) int64
-        ``hist_dense_61``:   (B, K, hist_dense_dim_61) float
-        ``hist_dense_87``:   (B, K, hist_dense_dim_87) float
+        ``hist_scalars``: (B, K, len(scalar_embs)) int64
+        ``hist_dense``:   (B, K, hist_dense_dim) float
         """
         B, K, n_fids = hist_scalars.shape
 
@@ -1597,12 +1582,11 @@ class ItemHistUserModule(nn.Module):
         scalar_emb = torch.cat(per_feat, dim=-1)              # (B*K, scalar_dim)
         scalar_emb = scalar_emb.view(B, K, -1)
 
-        # Independent dense projections
-        d61 = self.dense_proj_61(hist_dense_61)               # (B, K, D)
-        d87 = self.dense_proj_87(hist_dense_87)               # (B, K, D)
+        # Dense projection
+        dense_emb = self.dense_proj(hist_dense)               # (B, K, D)
 
         # Combine to one token per user
-        tok = torch.cat([scalar_emb, d61, d87], dim=-1)
+        tok = torch.cat([scalar_emb, dense_emb], dim=-1)
         tok = self.token_proj(tok)                            # (B, K, D)
         return tok
 
@@ -1643,15 +1627,12 @@ class ItemHistUserModule(nn.Module):
     def forward(
         self,
         current_scalars: torch.Tensor,     # (B, n_fids) int64 — current user's scalars
-        current_dense_61: torch.Tensor,    # (B, hist_dense_dim_61) — current user's dense_61
-        current_dense_87: torch.Tensor,    # (B, hist_dense_dim_87) — current user's dense_87
+        current_dense: torch.Tensor,       # (B, hist_dense_dim) float — current user's dense_61
         hist_pos_scalars: torch.Tensor,
-        hist_pos_dense_61: torch.Tensor,
-        hist_pos_dense_87: torch.Tensor,
+        hist_pos_dense: torch.Tensor,
         hist_pos_lens: torch.Tensor,
         hist_neg_scalars: torch.Tensor,
-        hist_neg_dense_61: torch.Tensor,
-        hist_neg_dense_87: torch.Tensor,
+        hist_neg_dense: torch.Tensor,
         hist_neg_lens: torch.Tensor,
     ) -> torch.Tensor:
         """Return the gated-residual delta ``(B, d_model)`` to be added onto
@@ -1666,10 +1647,9 @@ class ItemHistUserModule(nn.Module):
 
         # Encode current user as a 1-element pool with the same encoder.
         query = self.encode_hist_users(
-            current_scalars.unsqueeze(1),       # (B, 1, n_fids)
-            current_dense_61.unsqueeze(1),      # (B, 1, hist_dense_dim_61)
-            current_dense_87.unsqueeze(1),      # (B, 1, hist_dense_dim_87)
-        )                                       # (B, 1, D)
+            current_scalars.unsqueeze(1),  # (B, 1, n_fids)
+            current_dense.unsqueeze(1),     # (B, 1, hist_dense_dim)
+        )                                   # (B, 1, D)
 
         if self.training and self.history_dropout > 0:
             is_dropped = (
@@ -1678,12 +1658,8 @@ class ItemHistUserModule(nn.Module):
         else:
             is_dropped = torch.zeros(B, dtype=torch.bool, device=device)
 
-        pos_kv = self.encode_hist_users(
-            hist_pos_scalars, hist_pos_dense_61, hist_pos_dense_87
-        )
-        neg_kv = self.encode_hist_users(
-            hist_neg_scalars, hist_neg_dense_61, hist_neg_dense_87
-        )
+        pos_kv = self.encode_hist_users(hist_pos_scalars, hist_pos_dense)
+        neg_kv = self.encode_hist_users(hist_neg_scalars, hist_neg_dense)
 
         pos_out = self._cross_attend_with_fallback(
             query, pos_kv, hist_pos_lens,
@@ -1764,8 +1740,7 @@ class PCVRHyFormer(nn.Module):
         # positions to BORROW the relevant Embedding tables from
         # ``user_ns_tokenizer`` (shared weights, same semantic space).
         hist_scalar_fid_positions: Optional[List[int]] = None,
-        hist_dense_dim_61: int = 256,
-        hist_dense_dim_87: int = 320,
+        hist_dense_dim: int = 256,
         hist_dropout: float = 0.1,
         hist_num_heads: Optional[int] = None,  # default = num_heads
     ) -> None:
@@ -2056,14 +2031,15 @@ class PCVRHyFormer(nn.Module):
 
             # Strict Q/KV feature alignment: current user is encoded via the
             # SAME ItemHistUserModule.encode_hist_users path as historical
-            # users, using the 12 scalar fids + dense_61 (ID emb, 256d) +
-            # dense_87 (behavior history emb, 320d). This puts Q and K/V in
-            # literally the same space (same weights, same features).
+            # users, using only the 7 scalar fids + dense_61. This puts Q and
+            # K/V in literally the same space (same weights, same features).
+            # The previous UserQueryPool over the 12 user_ns tokens is gone —
+            # those tokens carry many features that hist users don't have,
+            # making the cross-attention dot product asymmetric.
             self.user_query_pool = None
             self.hist_user_module = ItemHistUserModule(
                 scalar_vocab_sizes=scalar_vocab_sizes,
-                hist_dense_dim_61=hist_dense_dim_61,
-                hist_dense_dim_87=hist_dense_dim_87,
+                hist_dense_dim=hist_dense_dim,
                 d_model=d_model,
                 num_heads=hist_num_heads or num_heads,
                 emb_dim_base=emb_dim,
@@ -2078,30 +2054,15 @@ class PCVRHyFormer(nn.Module):
                 torch.tensor(scalar_int_offsets, dtype=torch.long),
                 persistent=False,
             )
-            # user_dense_feats layout (see _encode_user_dense):
-            #   [0, user_emb_dim)                       = dense_61 (256d)
-            #   [user_emb_dim, user_emb_dim + 87_dim)   = dense_87 (320d)
-            #   [..., end)                              = hod (2d)
-            # The hist module needs both slices, so user_emb_dim must equal
-            # hist_dense_dim_61 and user_seq_num*user_seq_block_dim must equal
-            # hist_dense_dim_87.
-            cur_dense_87_size = int(user_seq_num) * int(user_seq_block_dim)
-            if not self.has_user_dense or int(user_emb_dim) != int(hist_dense_dim_61):
+            # dense_61 in user_dense_feats lives at [0, user_emb_dim) by the
+            # same convention as _encode_user_dense. Verify the size matches
+            # hist_dense_dim so the encoder can be shared between sides.
+            if not self.has_user_dense or int(user_emb_dim) != int(hist_dense_dim):
                 raise ValueError(
                     f"enable_hist_users requires user_dense to be present and "
-                    f"user_emb_dim ({user_emb_dim}) to equal hist_dense_dim_61 "
-                    f"({hist_dense_dim_61}); current layout incompatible."
+                    f"user_emb_dim ({user_emb_dim}) to equal hist_dense_dim "
+                    f"({hist_dense_dim}); current layout incompatible."
                 )
-            if cur_dense_87_size != int(hist_dense_dim_87):
-                raise ValueError(
-                    f"enable_hist_users requires user_seq_num*user_seq_block_dim "
-                    f"({cur_dense_87_size}) to equal hist_dense_dim_87 "
-                    f"({hist_dense_dim_87})."
-                )
-            # Record offsets for slicing the current user's dense_61 / dense_87
-            # out of user_dense_feats at forward time.
-            self._cur_dense_61_end = int(user_emb_dim)
-            self._cur_dense_87_end = int(user_emb_dim) + cur_dense_87_size
         else:
             self.user_query_pool = None
             self.hist_user_module = None
@@ -2546,21 +2507,17 @@ class PCVRHyFormer(nn.Module):
             cur_scalars = inputs.user_int_feats.index_select(
                 1, self.hist_scalar_user_int_offsets
             )
-            cur_dense_61 = inputs.user_dense_feats[:, : self._cur_dense_61_end]
-            cur_dense_87 = inputs.user_dense_feats[
-                :, self._cur_dense_61_end : self._cur_dense_87_end
+            cur_dense = inputs.user_dense_feats[
+                :, : self.hist_user_module.dense_proj[0].in_features
             ]
             hist_delta = self.hist_user_module(
                 cur_scalars,
-                cur_dense_61,
-                cur_dense_87,
+                cur_dense,
                 inputs.hist_pos_scalars,
-                inputs.hist_pos_dense61,
-                inputs.hist_pos_dense87,
+                inputs.hist_pos_dense,
                 inputs.hist_pos_lens,
                 inputs.hist_neg_scalars,
-                inputs.hist_neg_dense61,
-                inputs.hist_neg_dense87,
+                inputs.hist_neg_dense,
                 inputs.hist_neg_lens,
             )
             output = output + hist_delta
@@ -2637,21 +2594,17 @@ class PCVRHyFormer(nn.Module):
             cur_scalars = inputs.user_int_feats.index_select(
                 1, self.hist_scalar_user_int_offsets
             )
-            cur_dense_61 = inputs.user_dense_feats[:, : self._cur_dense_61_end]
-            cur_dense_87 = inputs.user_dense_feats[
-                :, self._cur_dense_61_end : self._cur_dense_87_end
+            cur_dense = inputs.user_dense_feats[
+                :, : self.hist_user_module.dense_proj[0].in_features
             ]
             hist_delta = self.hist_user_module(
                 cur_scalars,
-                cur_dense_61,
-                cur_dense_87,
+                cur_dense,
                 inputs.hist_pos_scalars,
-                inputs.hist_pos_dense61,
-                inputs.hist_pos_dense87,
+                inputs.hist_pos_dense,
                 inputs.hist_pos_lens,
                 inputs.hist_neg_scalars,
-                inputs.hist_neg_dense61,
-                inputs.hist_neg_dense87,
+                inputs.hist_neg_dense,
                 inputs.hist_neg_lens,
             )
             output = output + hist_delta

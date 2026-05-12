@@ -71,18 +71,13 @@ _FALLBACK_MODEL_CFG = {
     # ── Item-history-user is required at infer time. We don't include
     # ``enable_hist_users`` in the fallback map because there is no "off" mode:
     # main() asserts it and the model is always built with hist on.
-    "hist_dense_dim_61": 256,
-    "hist_dense_dim_87": 320,
+    "hist_dense_dim": 256,
     "hist_dropout": 0.1,
 }
 
 _FALLBACK_SEQ_MAX_LENS = "seq_a:256,seq_b:256,seq_c:512,seq_d:512"
 _FALLBACK_BATCH_SIZE = 256
 _FALLBACK_NUM_WORKERS = 16
-
-# Hist scalar fids — MUST match build_item_hist_users.USER_SCALAR_FIDS and
-# train.HIST_SCALAR_FIDS exactly, in order.
-HIST_SCALAR_FIDS: List[int] = [1, 3, 4, 48, 49, 50, 51, 52, 53, 55, 56, 57]
 
 
 # Hyperparameter keys used to build the model. Everything else in
@@ -240,15 +235,16 @@ def build_model(
         dataset.item_int_schema, dataset.item_int_vocab_sizes
     )
 
-    # The hist branch is mandatory at infer time. Resolve positions of the
+    # The hist branch is mandatory at infer time. Resolve positions of the 7
     # scalar fids in the live schema (the indices vary per schema, so they
     # can't be cached in train_config).
+    hist_fids = [1, 48, 49, 50, 51, 52, 53]
     fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)}
     try:
         model_cfg = {
             **model_cfg,
             "enable_hist_users": True,
-            "hist_scalar_fid_positions": [fid_to_idx[f] for f in HIST_SCALAR_FIDS],
+            "hist_scalar_fid_positions": [fid_to_idx[f] for f in hist_fids],
         }
     except KeyError as exc:
         raise KeyError(
@@ -361,11 +357,9 @@ def _batch_to_model_input(
         seq_ts_float_feats=seq_ts_float_feats,
         seq_ts_stat_feats=seq_ts_stat_feats,
         hist_pos_scalars=device_batch.get("hist_pos_scalars"),
-        hist_pos_dense61=device_batch.get("hist_pos_dense61"),
-        hist_pos_dense87=device_batch.get("hist_pos_dense87"),
+        hist_pos_dense=device_batch.get("hist_pos_dense"),
         hist_neg_scalars=device_batch.get("hist_neg_scalars"),
-        hist_neg_dense61=device_batch.get("hist_neg_dense61"),
-        hist_neg_dense87=device_batch.get("hist_neg_dense87"),
+        hist_neg_dense=device_batch.get("hist_neg_dense"),
         hist_pos_lens=device_batch.get("hist_pos_lens"),
         hist_neg_lens=device_batch.get("hist_neg_lens"),
     )
@@ -447,25 +441,19 @@ def main() -> None:
     model_cfg = resolve_model_cfg(train_config)
 
     # Cross-check the hist file shape against what the checkpoint expects.
-    # A stale or mismatched hist build (different USER_DENSE_FID or scalar
-    # fid list) would otherwise surface as a shape error deep inside the
-    # model forward; catch it at the entry instead.
-    if test_dataset.hist_dense_dim_61 != int(model_cfg["hist_dense_dim_61"]):
+    # A stale or mismatched hist build (e.g. different USER_DENSE_FID, or a
+    # different set of scalar fids) would otherwise surface as a shape error
+    # deep inside the model forward; catch it at the entry instead.
+    if test_dataset.hist_dense_dim != int(model_cfg["hist_dense_dim"]):
         raise ValueError(
-            f"hist_users dir dense_dim_61={test_dataset.hist_dense_dim_61} "
-            f"!= checkpoint hist_dense_dim_61={model_cfg['hist_dense_dim_61']}. "
-            f"Rebuild the item-history table against USER_DENSE_FID_61."
+            f"hist_users dir dense_dim={test_dataset.hist_dense_dim} "
+            f"does not match checkpoint hist_dense_dim={model_cfg['hist_dense_dim']}. "
+            f"Rebuild the item-history table against the same USER_DENSE_FID."
         )
-    if test_dataset.hist_dense_dim_87 != int(model_cfg["hist_dense_dim_87"]):
-        raise ValueError(
-            f"hist_users dir dense_dim_87={test_dataset.hist_dense_dim_87} "
-            f"!= checkpoint hist_dense_dim_87={model_cfg['hist_dense_dim_87']}. "
-            f"Rebuild the item-history table against USER_DENSE_FID_87."
-        )
-    if test_dataset.hist_num_scalars != len(HIST_SCALAR_FIDS):
+    if test_dataset.hist_num_scalars != 7:
         raise ValueError(
             f"hist_users dir has {test_dataset.hist_num_scalars} scalar fids, "
-            f"but the checkpoint expects {len(HIST_SCALAR_FIDS)}."
+            f"but the checkpoint expects exactly 7."
         )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
