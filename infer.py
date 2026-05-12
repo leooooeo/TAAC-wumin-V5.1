@@ -381,12 +381,6 @@ def main() -> None:
             "infer time; build the item-history table with build_item_hist_users.py "
             "and point EVAL_HIST_USERS_DIR at its output directory."
         )
-    # Sampling budget; default to "use everything" for inference so the test
-    # row sees as much training history per item as possible. time_gap=0
-    # because test ts is later than all training ts — no leakage risk.
-    hist_k_pos = int(os.environ.get("EVAL_HIST_K_POS", "32"))
-    hist_k_neg = int(os.environ.get("EVAL_HIST_K_NEG", "64"))
-    hist_time_gap = int(os.environ.get("EVAL_HIST_TIME_GAP", "0"))
 
     os.makedirs(result_dir, exist_ok=True)
 
@@ -401,6 +395,22 @@ def main() -> None:
 
     # ---- Load train_config.json (single source of truth for all hyperparams) ----
     train_config = load_train_config(model_dir)
+
+    # Sampling budget. Defaults inherit from train_config (and fall back to
+    # train.py's CLI defaults 16 / 32) so the cross-attention K-axis
+    # distribution at infer matches what the model saw during training; a
+    # different K would shift the softmax + padding-ratio + empty-token-
+    # frequency distribution that the model was fit to. Env vars override.
+    #
+    # time_gap=0 at infer (vs ~3600 at train) because every test ts is later
+    # than every training ts, so there is no leakage to gate against.
+    hist_k_pos = int(
+        os.environ.get("EVAL_HIST_K_POS", str(train_config.get("hist_k_pos", 16)))
+    )
+    hist_k_neg = int(
+        os.environ.get("EVAL_HIST_K_NEG", str(train_config.get("hist_k_neg", 32)))
+    )
+    hist_time_gap = int(os.environ.get("EVAL_HIST_TIME_GAP", "0"))
 
     # ---- Parse seq_max_lens ----
     sml_str = train_config.get("seq_max_lens", _FALLBACK_SEQ_MAX_LENS)
@@ -429,6 +439,22 @@ def main() -> None:
 
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
+
+    # Cross-check the hist file shape against what the checkpoint expects.
+    # A stale or mismatched hist build (e.g. different USER_DENSE_FID, or a
+    # different set of scalar fids) would otherwise surface as a shape error
+    # deep inside the model forward; catch it at the entry instead.
+    if test_dataset.hist_dense_dim != int(model_cfg["hist_dense_dim"]):
+        raise ValueError(
+            f"hist_users dir dense_dim={test_dataset.hist_dense_dim} "
+            f"does not match checkpoint hist_dense_dim={model_cfg['hist_dense_dim']}. "
+            f"Rebuild the item-history table against the same USER_DENSE_FID."
+        )
+    if test_dataset.hist_num_scalars != 7:
+        raise ValueError(
+            f"hist_users dir has {test_dataset.hist_num_scalars} scalar fids, "
+            f"but the checkpoint expects exactly 7."
+        )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the
