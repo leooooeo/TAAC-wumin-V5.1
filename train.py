@@ -19,7 +19,7 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS_PER_DOMAIN
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -228,9 +228,9 @@ def parse_args() -> argparse.Namespace:
         "--use_time_buckets",
         action="store_true",
         default=True,
-        help="Enable the time-bucket embedding (default on). "
-        "The actual bucket count is uniquely determined by "
-        "dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.",
+        help="Enable per-domain time-bucket embeddings (default on). "
+        "Bucket counts come from dataset.NUM_TIME_BUCKETS_PER_DOMAIN; this "
+        "flag is a pure on/off switch.",
     )
     parser.add_argument(
         "--no_time_buckets",
@@ -515,7 +515,7 @@ def main() -> None:
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
-        "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "num_time_buckets": dict(NUM_TIME_BUCKETS_PER_DOMAIN) if args.use_time_buckets else {},
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,

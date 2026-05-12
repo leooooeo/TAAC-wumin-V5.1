@@ -1,4 +1,4 @@
-#!/bin/bas#!/bin/bash
+#!/bin/bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
@@ -23,9 +23,7 @@ if [ "$DEBUG_MODE" = true ]; then
 fi
 
 
-# 根据 DEBUG_MODE 设置不同的训练参数
 if [ "$DEBUG_MODE" = true ]; then
-    # Debug 模式参数
     python3 -u "${SCRIPT_DIR}/train.py" \
         --lr 2e-4 \
         --num_epochs 2 \
@@ -46,7 +44,6 @@ if [ "$DEBUG_MODE" = true ]; then
         --reinit_cardinality_threshold 999999 \
         "$@"
 else
-    # 正常模式参数
     python3 -u "${SCRIPT_DIR}/train.py" \
         --seed 7789 \
         --lr 1e-4 \

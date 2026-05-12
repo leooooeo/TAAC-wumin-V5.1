@@ -213,34 +213,48 @@ class FeatureSchema:
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy("file_system")
 
-# Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
+# Per-domain time-delta bucket boundaries. Each domain has 31 edges -> 32
+# buckets (0=padding, 1..31). Edges come from quantile-based EDA over training
+# data (see eda_time_buckets.py); each domain's time-diff distribution differs
+# by orders of magnitude (seq_d in hours/days, seq_c in months/years), so a
+# shared boundary array wastes most of the embedding rows.
 # fmt: off
-BUCKET_BOUNDARIES = np.array([
-    5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
-    120, 180, 240, 300, 360, 420, 480, 540, 600,
-    900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600,
-    5400, 7200, 9000, 10800, 12600, 14400, 16200, 18000, 19800, 21600,
-    32400, 43200, 54000, 64800, 75600, 86400,
-    172800, 259200, 345600, 432000, 518400, 604800,
-    1123200, 1641600, 2160000, 2592000,
-    4320000, 6048000, 7776000,
-    11664000, 15552000,
-    31536000,
-], dtype=np.int64)
+BUCKET_BOUNDARIES_BY_DOMAIN: Dict[str, np.ndarray] = {
+    "seq_a": np.array([
+        330480, 722582, 1122163, 1533506, 1948265, 2393328, 3028250, 3550453,
+        3976184, 4395480, 4816195, 5242333, 5668218, 6103122, 6567956, 7044322,
+        7530254, 8012739, 8505949, 9001969, 9466959, 9947958, 10432169, 10949574,
+        11499131, 12070096, 12638576, 13226141, 13845003, 14484606, 15147417,
+    ], dtype=np.int64),
+    "seq_b": np.array([
+        244931, 496751, 754967, 1016629, 1289303, 1565646, 1843575, 2115951,
+        2433284, 3003610, 3577878, 4046336, 4783403, 5439847, 6167993, 6917995,
+        7717999, 8547006, 9419898, 10323943, 11185021, 11489043, 11796064, 12113405,
+        12439628, 12794830, 13158687, 13530320, 13954017, 14364710, 14811584,
+    ], dtype=np.int64),
+    "seq_c": np.array([
+        1263978, 2623626, 4050821, 5469978, 6940799, 8410736, 9890124, 11410851,
+        12944240, 14493189, 15965214, 17551516, 19044890, 20555049, 22082225, 23644813,
+        25175531, 26718031, 28346558, 30013597, 31725137, 33605504, 35431953, 37287411,
+        39285931, 41294716, 43314761, 45320790, 47423046, 49580268, 51787284,
+    ], dtype=np.int64),
+    "seq_d": np.array([
+        87674, 195235, 296356, 485519, 577828, 666596, 759548, 880856,
+        980621, 1078009, 1178737, 1282982, 1391314, 1506980, 1624702, 1750518,
+        1866886, 1991049, 2117656, 2253272, 2393340, 2546598, 2715485, 2897087,
+        3103662, 3314833, 3537557, 3762902, 4007009, 4270626, 4546355,
+    ], dtype=np.int64),
+}
 
 PAIR_FEATURES = [62, 63, 64, 65, 66, 89, 90, 91]
 # fmt: on
 
-# Total number of time-bucket embedding slots (= number of boundaries + 1, with
-# padding=0 included).
-#
-# This constant is uniquely determined by the length of BUCKET_BOUNDARIES; on
-# the model side, ``nn.Embedding(num_embeddings=NUM_TIME_BUCKETS)`` must match
-# this value exactly, otherwise an IndexError may be raised at runtime.
-#
-# That is why ``train.py`` / ``infer.py`` only expose the boolean flag
-# ``--use_time_buckets`` and derive the concrete bucket count from here.
-NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
+# Per-domain embedding table size (= boundaries + 1 for padding slot 0). The
+# model builds an ``nn.Embedding(NUM_TIME_BUCKETS_PER_DOMAIN[d], d_model)`` for
+# each domain, so these sizes are authoritative.
+NUM_TIME_BUCKETS_PER_DOMAIN: Dict[str, int] = {
+    d: len(b) + 1 for d, b in BUCKET_BOUNDARIES_BY_DOMAIN.items()
+}
 
 # Number of scalars in ts_stat_feats per sequence domain.
 # Consumers (model.py / trainer.py / infer.py) import this constant so that
@@ -979,8 +993,9 @@ class PCVRParquetDataset(IterableDataset):
                 time_diff = timestamps[:, None] - ts_padded
                 np.maximum(time_diff, 0, out=time_diff)
 
-                raw_buckets = np.searchsorted(BUCKET_BOUNDARIES, time_diff, side="left")
-                np.clip(raw_buckets, 0, len(BUCKET_BOUNDARIES) - 1, out=raw_buckets)
+                domain_boundaries = BUCKET_BOUNDARIES_BY_DOMAIN[domain]
+                raw_buckets = np.searchsorted(domain_boundaries, time_diff, side="left")
+                np.clip(raw_buckets, 0, len(domain_boundaries) - 1, out=raw_buckets)
 
                 buckets = raw_buckets + 1
                 buckets[ts_padded == 0] = 0
