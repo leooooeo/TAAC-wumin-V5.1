@@ -22,6 +22,18 @@ class ModelInput(NamedTuple):
     seq_time_buckets: dict  # {domain: tensor [B, L]}
     seq_ts_float_feats: dict  # {domain: tensor [B, 8, L]} float time-derived feats
     seq_ts_stat_feats: dict  # {domain: tensor [B, 6]} precomputed time stats
+    # Item-history-user pools (only populated when ItemHistUserModule is enabled
+    # and the dataset was built via build_item_hist_users.py). Each row gets two
+    # variable-length pools of past users that interacted with the same item:
+    #   pos pool: label_type==2 (converters)
+    #   neg pool: label_type==1 (shown but did not convert)
+    # ``hist_*_lens`` masks the K axis. None when the hist branch is disabled.
+    hist_pos_scalars: Optional[torch.Tensor] = None   # (B, K_pos, 7) int64
+    hist_pos_dense: Optional[torch.Tensor] = None     # (B, K_pos, 256) float
+    hist_neg_scalars: Optional[torch.Tensor] = None   # (B, K_neg, 7) int64
+    hist_neg_dense: Optional[torch.Tensor] = None     # (B, K_neg, 256) float
+    hist_pos_lens: Optional[torch.Tensor] = None      # (B,) int32
+    hist_neg_lens: Optional[torch.Tensor] = None      # (B,) int32
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1434,6 +1446,238 @@ class CrossRankMixerNSTokenizer(nn.Module):
         return torch.cat(outs, dim=-1)  # (B, out_dim)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Item-history-user module (audience matching, no item_id required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class UserQueryPool(nn.Module):
+    """Pool the ``num_user_ns`` pre-HyFormer user NS tokens into a single query
+    token via one learnable cross-attention.
+
+    Used as the Q side of ItemHistUserModule's two cross-attentions. We use the
+    PRE-HyFormer user tokens (not the post-HyFormer mixed output) so that the
+    Q and K/V live in the same pure-user semantic space — see project notes.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.attn = CrossAttention(
+            d_model=d_model, num_heads=num_heads, dropout=dropout, ln_mode="pre"
+        )
+
+    def forward(self, user_ns_tokens: torch.Tensor) -> torch.Tensor:
+        """user_ns_tokens: (B, num_user_ns, D) → (B, 1, D)."""
+        B = user_ns_tokens.size(0)
+        q = self.query.expand(B, -1, -1)
+        return self.attn(q, user_ns_tokens, key_padding_mask=None)
+
+
+class ItemHistUserModule(nn.Module):
+    """Encode the per-row item-history-user pools and cross-attend with the
+    current user, producing two ``(B, d_model)`` representations (one per
+    pool). The caller injects them as 2 extra "virtual domain" reprs into
+    ``_domain_sequence_gate`` so they participate in the same softmax-weighted
+    merge as the 4 sequence domains.
+
+    Design notes:
+    - The 7 scalar features per historical user have their OWN Embedding
+      tables in this module (no longer shared with ``user_ns_tokenizer``).
+      Sharing was an alignment hypothesis that didn't pan out — owning the
+      tables gives the hist branch a clean independent representation space.
+    - The 256-d dense_61 user embedding goes through a private MLP.
+    - Per-user token = ``Linear(cat[scalar_embs, dense_proj]) → d_model``.
+    - Cross-attention: query = single pooled user token (B,1,D); KV = K hist
+      tokens; key_padding_mask is built from ``hist_*_lens``.
+    - Cold-pool fallback: when ``hist_*_lens==0`` or random history dropout
+      fires (training only, prob ``hist_dropout``), the attention output is
+      OVERWRITTEN by a learnable empty token (per pool).
+    - This module is INTENTIONALLY headless on fusion: it does NOT decide how
+      its two outputs are mixed with the backbone. ``forward`` returns the
+      tuple ``(pos_t, neg_t)`` and PCVRHyFormer feeds those tensors into
+      ``_domain_sequence_gate`` as 2 extra reprs, with dedicated score MLPs.
+    """
+
+    def __init__(
+        self,
+        scalar_vocab_sizes: List[int],
+        hist_dense_dim: int,
+        d_model: int,
+        num_heads: int,
+        emb_dim_base: int = 64,
+        dropout: float = 0.0,
+        history_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.history_dropout = history_dropout
+
+        # Own scalar embedding tables (one per hist scalar fid). vocab_size+1
+        # accounts for the implicit padding row at index 0, matching the
+        # convention used by RankMixerNSTokenizer.
+        embs: List[nn.Embedding] = []
+        emb_dims: List[int] = []
+        for vs in scalar_vocab_sizes:
+            emb_d = get_emb_dim(int(vs), emb_dim_base)
+            embs.append(nn.Embedding(int(vs) + 1, emb_d, padding_idx=0))
+            emb_dims.append(emb_d)
+        self.scalar_embs = nn.ModuleList(embs)
+        self.scalar_emb_dims = emb_dims
+        scalar_total_dim = sum(emb_dims)
+
+        # Private dense_61 projection (fresh params)
+        self.dense_proj = nn.Sequential(
+            nn.Linear(hist_dense_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        # Per-user token projection: (scalar_emb_cat | dense_proj) → d_model
+        self.token_proj = nn.Sequential(
+            nn.Linear(scalar_total_dim + d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        # Cross-attention modules — independent params for pos vs neg pool
+        self.pos_attn = CrossAttention(
+            d_model=d_model, num_heads=num_heads, dropout=dropout, ln_mode="pre"
+        )
+        self.neg_attn = CrossAttention(
+            d_model=d_model, num_heads=num_heads, dropout=dropout, ln_mode="pre"
+        )
+
+        # Learnable cold-pool fallback tokens (one per pool)
+        self.empty_pos = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.empty_neg = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+        # Gated residual fusion: hist contribution is added on top of the
+        # backbone output, with a per-dim sigmoid gate so the model can
+        # shrink the add-on when hist is unreliable. Gate input is
+        # [pos_t, neg_t] only (no baseline output) so the gate can't collapse
+        # into a copy of the backbone signal.
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid(),
+        )
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def encode_hist_users(
+        self, hist_scalars: torch.Tensor, hist_dense: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode K historical users per sample → (B, K, d_model) tokens.
+
+        ``hist_scalars``: (B, K, len(scalar_embs)) int64
+        ``hist_dense``:   (B, K, hist_dense_dim) float
+        """
+        B, K, n_fids = hist_scalars.shape
+
+        # Scalar embeddings — flat across (B*K) for fewer kernel launches
+        flat = hist_scalars.reshape(B * K, n_fids).long()
+        per_feat: List[torch.Tensor] = []
+        for j, emb in enumerate(self.scalar_embs):
+            per_feat.append(emb(flat[:, j]))
+        scalar_emb = torch.cat(per_feat, dim=-1)              # (B*K, scalar_dim)
+        scalar_emb = scalar_emb.view(B, K, -1)
+
+        # Dense projection
+        dense_emb = self.dense_proj(hist_dense)               # (B, K, D)
+
+        # Combine to one token per user
+        tok = torch.cat([scalar_emb, dense_emb], dim=-1)
+        tok = self.token_proj(tok)                            # (B, K, D)
+        return tok
+
+    def _cross_attend_with_fallback(
+        self,
+        query: torch.Tensor,           # (B, 1, D)
+        kv: torch.Tensor,              # (B, K, D)
+        kv_lens: torch.Tensor,         # (B,)
+        empty_token: torch.Tensor,     # (1, 1, D)
+        attn: nn.Module,
+        is_dropped: torch.Tensor,      # (B,) bool
+    ) -> torch.Tensor:
+        """Run cross-attention with a key_padding_mask built from ``kv_lens``,
+        then OVERWRITE the output of rows whose pool is empty or whose history
+        was dropped this step — using the learnable ``empty_token``.
+        """
+        B, K, D = kv.shape
+        device = kv.device
+        idx = torch.arange(K, device=device).unsqueeze(0)             # (1, K)
+        pad_mask = idx >= kv_lens.to(device=device).unsqueeze(1)      # (B, K)
+
+        pool_empty = (kv_lens == 0)
+        use_empty = pool_empty | is_dropped                            # (B,)
+        if use_empty.any():
+            # All-padding rows: flip slot 0 to non-pad to avoid NaN softmax.
+            first_slot = use_empty.unsqueeze(1) & (idx == 0)
+            pad_mask = pad_mask & ~first_slot
+
+        out = attn(query, kv, key_padding_mask=pad_mask)              # (B,1,D)
+
+        out = torch.where(
+            use_empty.view(B, 1, 1),
+            empty_token.expand(B, 1, D),
+            out,
+        )
+        return out  # (B, 1, D)
+
+    def forward(
+        self,
+        current_scalars: torch.Tensor,     # (B, n_fids) int64 — current user's scalars
+        current_dense: torch.Tensor,       # (B, hist_dense_dim) float — current user's dense_61
+        hist_pos_scalars: torch.Tensor,
+        hist_pos_dense: torch.Tensor,
+        hist_pos_lens: torch.Tensor,
+        hist_neg_scalars: torch.Tensor,
+        hist_neg_dense: torch.Tensor,
+        hist_neg_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the gated-residual delta ``(B, d_model)`` to be added onto
+        the HyFormer output by the caller.
+
+        Q (current user) and K/V (historical users) are encoded by the SAME
+        ``encode_hist_users`` path, so the cross-attention dot products live
+        in one space.
+        """
+        B = current_scalars.size(0)
+        device = current_scalars.device
+
+        # Encode current user as a 1-element pool with the same encoder.
+        query = self.encode_hist_users(
+            current_scalars.unsqueeze(1),  # (B, 1, n_fids)
+            current_dense.unsqueeze(1),     # (B, 1, hist_dense_dim)
+        )                                   # (B, 1, D)
+
+        if self.training and self.history_dropout > 0:
+            is_dropped = (
+                torch.rand(B, device=device) < self.history_dropout
+            )
+        else:
+            is_dropped = torch.zeros(B, dtype=torch.bool, device=device)
+
+        pos_kv = self.encode_hist_users(hist_pos_scalars, hist_pos_dense)
+        neg_kv = self.encode_hist_users(hist_neg_scalars, hist_neg_dense)
+
+        pos_out = self._cross_attend_with_fallback(
+            query, pos_kv, hist_pos_lens,
+            self.empty_pos, self.pos_attn, is_dropped,
+        )
+        neg_out = self._cross_attend_with_fallback(
+            query, neg_kv, hist_neg_lens,
+            self.empty_neg, self.neg_attn, is_dropped,
+        )
+
+        pos_t = pos_out.squeeze(1)                       # (B, D)
+        neg_t = neg_out.squeeze(1)
+        cat = torch.cat([pos_t, neg_t], dim=-1)          # (B, 2D)
+        gate = self.fusion_gate(cat)                     # (B, D)
+        delta = self.fusion_proj(cat)                    # (B, D)
+        return gate * delta                              # (B, D)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1482,6 +1726,23 @@ class PCVRHyFormer(nn.Module):
         # DIN: item_ns attends over each sequence domain before HyFormer blocks.
         # Updates item_ns in-place (residual), no change to num_ns or T.
         use_din: bool = False,
+        # ── Item-history-user (audience matching) module ──
+        # If ``enable_hist_users`` is True, the model builds an
+        # ItemHistUserModule that encodes the current user AND the per-row
+        # pos/neg historical-user pools with one shared encoder, producing
+        # two pool reprs that enter ``_domain_sequence_gate`` as 2 extra
+        # virtual domains in the same softmax-weighted merge as the 4 seq
+        # domains. Q and K/V share weights and feature set, so the cross-
+        # attention dot product is strictly aligned.
+        enable_hist_users: bool = False,
+        # Positions of the 7 stable user scalar fids inside ``user_int_feature_specs``;
+        # required only when ``enable_hist_users=True``. The model uses these
+        # positions to BORROW the relevant Embedding tables from
+        # ``user_ns_tokenizer`` (shared weights, same semantic space).
+        hist_scalar_fid_positions: Optional[List[int]] = None,
+        hist_dense_dim: int = 256,
+        hist_dropout: float = 0.1,
+        hist_num_heads: Optional[int] = None,  # default = num_heads
     ) -> None:
         super().__init__()
 
@@ -1745,6 +2006,67 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(d_model, action_num),
         )
 
+        # ── Item-history-user module (optional add-on) ──
+        self.enable_hist_users = enable_hist_users
+        if enable_hist_users:
+            if hist_scalar_fid_positions is None:
+                raise ValueError(
+                    "enable_hist_users=True requires hist_scalar_fid_positions"
+                )
+            # Resolve vocab sizes AND offsets in user_int_feats for the chosen
+            # scalar fid positions from user_int_feature_specs (vs, off, len).
+            # Each fid must be length=1 (a true scalar), otherwise the offset
+            # alone isn't enough to slice it out of user_int_feats.
+            scalar_vocab_sizes: List[int] = []
+            scalar_int_offsets: List[int] = []
+            for pos in hist_scalar_fid_positions:
+                vs, offset, length = user_int_feature_specs[pos]
+                if int(length) != 1:
+                    raise ValueError(
+                        f"hist scalar at fid_position={pos} has length={length}; "
+                        f"only scalar (length=1) features are supported as hist scalars."
+                    )
+                scalar_vocab_sizes.append(int(vs))
+                scalar_int_offsets.append(int(offset))
+
+            # Strict Q/KV feature alignment: current user is encoded via the
+            # SAME ItemHistUserModule.encode_hist_users path as historical
+            # users, using only the 7 scalar fids + dense_61. This puts Q and
+            # K/V in literally the same space (same weights, same features).
+            # The previous UserQueryPool over the 12 user_ns tokens is gone —
+            # those tokens carry many features that hist users don't have,
+            # making the cross-attention dot product asymmetric.
+            self.user_query_pool = None
+            self.hist_user_module = ItemHistUserModule(
+                scalar_vocab_sizes=scalar_vocab_sizes,
+                hist_dense_dim=hist_dense_dim,
+                d_model=d_model,
+                num_heads=hist_num_heads or num_heads,
+                emb_dim_base=emb_dim,
+                dropout=dropout_rate,
+                history_dropout=hist_dropout,
+            )
+            # Column indices of the 7 scalar fids inside user_int_feats; used
+            # at forward time to gather current user's scalars (same column
+            # order as build_item_hist_users.py wrote into hist tensors).
+            self.register_buffer(
+                "hist_scalar_user_int_offsets",
+                torch.tensor(scalar_int_offsets, dtype=torch.long),
+                persistent=False,
+            )
+            # dense_61 in user_dense_feats lives at [0, user_emb_dim) by the
+            # same convention as _encode_user_dense. Verify the size matches
+            # hist_dense_dim so the encoder can be shared between sides.
+            if not self.has_user_dense or int(user_emb_dim) != int(hist_dense_dim):
+                raise ValueError(
+                    f"enable_hist_users requires user_dense to be present and "
+                    f"user_emb_dim ({user_emb_dim}) to equal hist_dense_dim "
+                    f"({hist_dense_dim}); current layout incompatible."
+                )
+        else:
+            self.user_query_pool = None
+            self.hist_user_module = None
+
         # Initialize parameters
         self._init_params()
 
@@ -1789,6 +2111,13 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        # ItemHistUserModule owns its own scalar embedding tables (no longer
+        # shared with user_ns_tokenizer); initialise them the same way.
+        if self.hist_user_module is not None:
+            for emb in self.hist_user_module.scalar_embs:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -2012,7 +2341,7 @@ class PCVRHyFormer(nn.Module):
             valid_domains.append(valid_domain)
 
         seq_repr_stack = torch.stack(seq_reprs, dim=1)  # (B, S, D)
-        scores_t = torch.cat(scores, dim=1)  # (B, S)
+        scores_t = torch.cat(scores, dim=1)             # (B, S)
         valid_mask = torch.stack(valid_domains, dim=1)  # (B, S)
         has_valid = valid_mask.any(dim=1, keepdim=True)
 
@@ -2145,7 +2474,12 @@ class PCVRHyFormer(nn.Module):
             [inputs.seq_ts_stat_feats[d] for d in self.seq_domains],
         )
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
+        # 4.0 Optional item-history-user encoding: pool the PRE-HyFormer user
+        # NS tokens to one query, cross-attend over the per-row pos/neg pools,
+        # and forward the two pool reprs into ``_run_multi_seq_blocks`` so
+        # they participate in the same softmax-weighted merge as the 4 seq
+        # domain reprs (6-way softmax instead of 4-way).
+        # 4. Dropout + MultiSeqHyFormerBlock stack + 4-way domain gate
         output, seq_weights = self._run_multi_seq_blocks(
             q_tokens_list,
             ns_tokens,
@@ -2157,6 +2491,36 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training,
         )
         self.last_seq_weights = seq_weights.detach()
+
+        # 4.5 Optional item-history-user gated-residual fusion.
+        # Q (current user) and K/V (historical users) are encoded by the SAME
+        # encode_hist_users path, so they share an aligned space. The hist
+        # module returns a gated delta which is added on top of the backbone.
+        if self.hist_user_module is not None:
+            if inputs.hist_pos_scalars is None:
+                raise ValueError(
+                    "Model was built with enable_hist_users=True but received "
+                    "ModelInput.hist_pos_scalars=None. The dataset must be "
+                    "constructed with hist_users_dir set to the same lookup "
+                    "directory the checkpoint was trained against."
+                )
+            cur_scalars = inputs.user_int_feats.index_select(
+                1, self.hist_scalar_user_int_offsets
+            )
+            cur_dense = inputs.user_dense_feats[
+                :, : self.hist_user_module.dense_proj[0].in_features
+            ]
+            hist_delta = self.hist_user_module(
+                cur_scalars,
+                cur_dense,
+                inputs.hist_pos_scalars,
+                inputs.hist_pos_dense,
+                inputs.hist_pos_lens,
+                inputs.hist_neg_scalars,
+                inputs.hist_neg_dense,
+                inputs.hist_neg_lens,
+            )
+            output = output + hist_delta
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -2225,6 +2589,25 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=False,
         )
         self.last_seq_weights = seq_weights.detach()
+
+        if self.hist_user_module is not None:
+            cur_scalars = inputs.user_int_feats.index_select(
+                1, self.hist_scalar_user_int_offsets
+            )
+            cur_dense = inputs.user_dense_feats[
+                :, : self.hist_user_module.dense_proj[0].in_features
+            ]
+            hist_delta = self.hist_user_module(
+                cur_scalars,
+                cur_dense,
+                inputs.hist_pos_scalars,
+                inputs.hist_pos_dense,
+                inputs.hist_pos_lens,
+                inputs.hist_neg_scalars,
+                inputs.hist_neg_dense,
+                inputs.hist_neg_lens,
+            )
+            output = output + hist_delta
 
         logits = self.clsfier(output)
         return logits, output

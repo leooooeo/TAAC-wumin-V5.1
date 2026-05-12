@@ -68,6 +68,12 @@ _FALLBACK_MODEL_CFG = {
     "user_ns_tokens": 0,
     "item_ns_tokens": 0,
     "use_din": False,
+    # ── Item-history-user defaults (off; turned on when train_config carries
+    # enable_hist_users=True). ``hist_scalar_fid_positions`` is resolved from
+    # the schema in build_model, not from train_config, so we omit it here.
+    "enable_hist_users": False,
+    "hist_dense_dim": 256,
+    "hist_dropout": 0.1,
 }
 
 _FALLBACK_SEQ_MAX_LENS = "seq_a:256,seq_b:256,seq_c:512,seq_d:512"
@@ -230,6 +236,24 @@ def build_model(
         dataset.item_int_schema, dataset.item_int_vocab_sizes
     )
 
+    # Resolve hist_scalar_fid_positions when the checkpoint was trained with
+    # the hist branch on. We keep the fid list identical to train.py
+    # (HIST_SCALAR_FIDS = [1, 48..53]); the positions vary per schema and must
+    # therefore be recomputed at infer time.
+    if model_cfg.get("enable_hist_users"):
+        hist_fids = [1, 48, 49, 50, 51, 52, 53]
+        fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)}
+        try:
+            model_cfg = {
+                **model_cfg,
+                "hist_scalar_fid_positions": [fid_to_idx[f] for f in hist_fids],
+            }
+        except KeyError as exc:
+            raise KeyError(
+                f"hist scalar fid {exc.args[0]} missing from schema; the "
+                f"checkpoint expects it for the hist branch."
+            ) from exc
+
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
@@ -334,6 +358,12 @@ def _batch_to_model_input(
         seq_time_buckets=seq_time_buckets,
         seq_ts_float_feats=seq_ts_float_feats,
         seq_ts_stat_feats=seq_ts_stat_feats,
+        hist_pos_scalars=device_batch.get("hist_pos_scalars"),
+        hist_pos_dense=device_batch.get("hist_pos_dense"),
+        hist_neg_scalars=device_batch.get("hist_neg_scalars"),
+        hist_neg_dense=device_batch.get("hist_neg_dense"),
+        hist_pos_lens=device_batch.get("hist_pos_lens"),
+        hist_neg_lens=device_batch.get("hist_neg_lens"),
     )
 
 
@@ -342,6 +372,11 @@ def main() -> None:
     model_dir = os.environ.get("MODEL_OUTPUT_PATH")
     data_dir = os.environ.get("EVAL_DATA_PATH")
     result_dir = os.environ.get("EVAL_RESULT_PATH")
+    # Optional: directory produced by build_item_hist_users.py over the
+    # inference data (train + test parquets combined, so test rows can look
+    # up past train interactions). Required only if the checkpoint was trained
+    # with enable_hist_users=True; otherwise it is ignored.
+    hist_users_dir = os.environ.get("EVAL_HIST_USERS_DIR")
 
     os.makedirs(result_dir, exist_ok=True)
 
@@ -374,6 +409,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        hist_users_dir=hist_users_dir,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
