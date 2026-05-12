@@ -104,8 +104,8 @@ else
         --seed 7789 \
         --lr 1e-4 \
         --num_epochs 7 \
-        --num_workers 8 \
-        --buffer_batches 32 \
+        --num_workers 4 \
+        --buffer_batches 16 \
         --d_model 96 \
         --num_queries 2 \
         --num_hyformer_blocks 2 \

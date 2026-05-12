@@ -1441,7 +1441,7 @@ def get_pcvr_data(
     _train_kw: Dict[str, Any] = {}
     if num_workers > 0:
         _train_kw["persistent_workers"] = True
-        _train_kw["prefetch_factor"] = 4
+        _train_kw["prefetch_factor"] = 2
 
     split_mode_l = split_mode.strip().lower()
     if split_mode_l == "timestamp":
@@ -1574,7 +1574,7 @@ def get_pcvr_data(
     _train_kw = {}
     if num_workers > 0:
         _train_kw["persistent_workers"] = True
-        _train_kw["prefetch_factor"] = 4
+        _train_kw["prefetch_factor"] = 2
 
     train_loader = DataLoader(
         train_dataset,
