@@ -1612,7 +1612,8 @@ class ItemHistUserModule(nn.Module):
 
     def forward(
         self,
-        user_query: torch.Tensor,          # (B, 1, D), from UserQueryPool
+        current_scalars: torch.Tensor,     # (B, n_fids) int64 — current user's scalars
+        current_dense: torch.Tensor,       # (B, hist_dense_dim) float — current user's dense_61
         hist_pos_scalars: torch.Tensor,
         hist_pos_dense: torch.Tensor,
         hist_pos_lens: torch.Tensor,
@@ -1621,10 +1622,20 @@ class ItemHistUserModule(nn.Module):
         hist_neg_lens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the two pool reprs ``(pos_t, neg_t)``, each shape (B, D).
-        Fusion onto the backbone is the caller's responsibility.
+
+        Q (current user) and K/V (historical users) are encoded by the SAME
+        ``encode_hist_users`` path, so the cross-attention dot products live
+        in literally one space. The caller is responsible for fusing the two
+        outputs into the backbone.
         """
-        B = user_query.size(0)
-        device = user_query.device
+        B = current_scalars.size(0)
+        device = current_scalars.device
+
+        # Encode current user as a 1-element pool with the same encoder.
+        query = self.encode_hist_users(
+            current_scalars.unsqueeze(1),  # (B, 1, n_fids)
+            current_dense.unsqueeze(1),     # (B, 1, hist_dense_dim)
+        )                                   # (B, 1, D)
 
         # History dropout (training-time only, applied per-row)
         if self.training and self.history_dropout > 0:
@@ -1638,11 +1649,11 @@ class ItemHistUserModule(nn.Module):
         neg_kv = self.encode_hist_users(hist_neg_scalars, hist_neg_dense)
 
         pos_out = self._cross_attend_with_fallback(
-            user_query, pos_kv, hist_pos_lens,
+            query, pos_kv, hist_pos_lens,
             self.empty_pos, self.pos_attn, is_dropped,
         )
         neg_out = self._cross_attend_with_fallback(
-            user_query, neg_kv, hist_neg_lens,
+            query, neg_kv, hist_neg_lens,
             self.empty_neg, self.neg_attn, is_dropped,
         )
 
@@ -1698,10 +1709,13 @@ class PCVRHyFormer(nn.Module):
         # Updates item_ns in-place (residual), no change to num_ns or T.
         use_din: bool = False,
         # ── Item-history-user (audience matching) module ──
-        # If ``enable_hist_users`` is True, the model builds a UserQueryPool +
-        # ItemHistUserModule that take per-row pos/neg user pools (pre-gathered
-        # by the dataset, see build_item_hist_users.py) and produce a gated
-        # delta added to the HyFormer output before the classifier.
+        # If ``enable_hist_users`` is True, the model builds an
+        # ItemHistUserModule that encodes the current user AND the per-row
+        # pos/neg historical-user pools with one shared encoder, producing
+        # two pool reprs that enter ``_domain_sequence_gate`` as 2 extra
+        # virtual domains in the same softmax-weighted merge as the 4 seq
+        # domains. Q and K/V share weights and feature set, so the cross-
+        # attention dot product is strictly aligned.
         enable_hist_users: bool = False,
         # Positions of the 7 stable user scalar fids inside ``user_int_feature_specs``;
         # required only when ``enable_hist_users=True``. The model uses these
@@ -1981,18 +1995,30 @@ class PCVRHyFormer(nn.Module):
                 raise ValueError(
                     "enable_hist_users=True requires hist_scalar_fid_positions"
                 )
-            # Resolve vocab sizes for the chosen scalar fid positions from
-            # user_int_feature_specs (vocab_size, offset, length).
-            scalar_vocab_sizes = [
-                int(user_int_feature_specs[pos][0])
-                for pos in hist_scalar_fid_positions
-            ]
+            # Resolve vocab sizes AND offsets in user_int_feats for the chosen
+            # scalar fid positions from user_int_feature_specs (vs, off, len).
+            # Each fid must be length=1 (a true scalar), otherwise the offset
+            # alone isn't enough to slice it out of user_int_feats.
+            scalar_vocab_sizes: List[int] = []
+            scalar_int_offsets: List[int] = []
+            for pos in hist_scalar_fid_positions:
+                vs, offset, length = user_int_feature_specs[pos]
+                if int(length) != 1:
+                    raise ValueError(
+                        f"hist scalar at fid_position={pos} has length={length}; "
+                        f"only scalar (length=1) features are supported as hist scalars."
+                    )
+                scalar_vocab_sizes.append(int(vs))
+                scalar_int_offsets.append(int(offset))
 
-            self.user_query_pool = UserQueryPool(
-                d_model=d_model,
-                num_heads=hist_num_heads or num_heads,
-                dropout=dropout_rate,
-            )
+            # Strict Q/KV feature alignment: current user is encoded via the
+            # SAME ItemHistUserModule.encode_hist_users path as historical
+            # users, using only the 7 scalar fids + dense_61. This puts Q and
+            # K/V in literally the same space (same weights, same features).
+            # The previous UserQueryPool over the 12 user_ns tokens is gone —
+            # those tokens carry many features that hist users don't have,
+            # making the cross-attention dot product asymmetric.
+            self.user_query_pool = None
             self.hist_user_module = ItemHistUserModule(
                 scalar_vocab_sizes=scalar_vocab_sizes,
                 hist_dense_dim=hist_dense_dim,
@@ -2002,6 +2028,23 @@ class PCVRHyFormer(nn.Module):
                 dropout=dropout_rate,
                 history_dropout=hist_dropout,
             )
+            # Column indices of the 7 scalar fids inside user_int_feats; used
+            # at forward time to gather current user's scalars (same column
+            # order as build_item_hist_users.py wrote into hist tensors).
+            self.register_buffer(
+                "hist_scalar_user_int_offsets",
+                torch.tensor(scalar_int_offsets, dtype=torch.long),
+                persistent=False,
+            )
+            # dense_61 in user_dense_feats lives at [0, user_emb_dim) by the
+            # same convention as _encode_user_dense. Verify the size matches
+            # hist_dense_dim so the encoder can be shared between sides.
+            if not self.has_user_dense or int(user_emb_dim) != int(hist_dense_dim):
+                raise ValueError(
+                    f"enable_hist_users requires user_dense to be present and "
+                    f"user_emb_dim ({user_emb_dim}) to equal hist_dense_dim "
+                    f"({hist_dense_dim}); current layout incompatible."
+                )
             # Score MLPs for the 2 hist "virtual domains" inside
             # _domain_sequence_gate's softmax. Mirrors seq_gate_score's role
             # but takes only the pool repr (no ts_stat / time_pool here).
@@ -2474,9 +2517,17 @@ class PCVRHyFormer(nn.Module):
                     "constructed with hist_users_dir set to the same lookup "
                     "directory the checkpoint was trained against."
                 )
-            user_query = self.user_query_pool(user_ns)              # (B, 1, D)
+            # Q/KV strict alignment: extract current user's same 7 scalar fids
+            # + dense_61 used by build_item_hist_users.py for historical users.
+            cur_scalars = inputs.user_int_feats.index_select(
+                1, self.hist_scalar_user_int_offsets
+            )                                                      # (B, n_fids)
+            cur_dense = inputs.user_dense_feats[
+                :, : self.hist_user_module.dense_proj[0].in_features
+            ]                                                       # (B, 256)
             hist_pos_repr, hist_neg_repr = self.hist_user_module(
-                user_query,
+                cur_scalars,
+                cur_dense,
                 inputs.hist_pos_scalars,
                 inputs.hist_pos_dense,
                 inputs.hist_pos_lens,
@@ -2559,9 +2610,15 @@ class PCVRHyFormer(nn.Module):
         hist_pos_repr = None
         hist_neg_repr = None
         if self.hist_user_module is not None:
-            user_query = self.user_query_pool(user_ns)
+            cur_scalars = inputs.user_int_feats.index_select(
+                1, self.hist_scalar_user_int_offsets
+            )
+            cur_dense = inputs.user_dense_feats[
+                :, : self.hist_user_module.dense_proj[0].in_features
+            ]
             hist_pos_repr, hist_neg_repr = self.hist_user_module(
-                user_query,
+                cur_scalars,
+                cur_dense,
                 inputs.hist_pos_scalars,
                 inputs.hist_pos_dense,
                 inputs.hist_pos_lens,
