@@ -155,13 +155,23 @@ def _fill_dense_column(
     out: np.ndarray,
     out_offset: int,
     col_offset: int,
+    apply_log1p: bool = False,
 ) -> None:
     """Write one dense (list<float>) column into out[row_off : row_off+B,
-    col_off : col_off+length]. Missing entries are left at 0."""
+    col_off : col_off+length]. Missing entries are left at 0.
+
+    ``apply_log1p`` mirrors dataset._convert_batch's pair_dense handling for
+    head pair features (fid < 89, which carry log-scale counts up to ~1e7).
+    Without this transform the fp16 cast overflows to inf for those columns
+    and silently corrupts the hist data."""
     list_arr = _as_single_array(tbl.column(col_name))
     offsets = list_arr.offsets.to_numpy()
     values = list_arr.values.to_numpy()
     padded = pad_varlen_float_jit(offsets, values, length)        # (B, length) fp32
+    if apply_log1p:
+        np.nan_to_num(padded, nan=0.0, copy=False)
+        np.maximum(padded, 0, out=padded)
+        np.log1p(padded, out=padded)
     B = tbl.num_rows
     out[out_offset:out_offset + B, col_offset:col_offset + length] = padded.astype(np.float16)
 
@@ -220,10 +230,16 @@ def scan_interactions(
                                  out["pair_int"], offset, col_off)
             for fid, _, length, col_off in user_dense_plan.entries:
                 _fill_dense_column(tbl, f"user_dense_feats_{fid}", length,
-                                   out["user_dense"], offset, col_off)
+                                   out["user_dense"], offset, col_off,
+                                   apply_log1p=False)
             for fid, _, length, col_off in pair_dense_plan.entries:
+                # Mirror dataset._convert_batch: head pair features
+                # (fid < 89: 62-66) carry log-scale counts and need log1p;
+                # tail pair features (fid 89-91: similarity scores in [-1,1])
+                # stay raw. Without this, fp16 cast overflows on 62-66.
                 _fill_dense_column(tbl, f"user_dense_feats_{fid}", length,
-                                   out["pair_dense"], offset, col_off)
+                                   out["pair_dense"], offset, col_off,
+                                   apply_log1p=(fid < 89))
 
             out["item_ids"][offset:offset + B] = (
                 tbl.column("item_id").fill_null(0)

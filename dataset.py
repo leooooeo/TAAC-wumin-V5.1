@@ -430,11 +430,18 @@ class PCVRParquetDataset(IterableDataset):
         self.hist_time_gap = int(hist_time_gap)
         self._hist_loaded = False
         self._hist_rng: Optional[np.random.Generator] = None
-        if hist_users_dir is not None:
-            self._load_hist_users(hist_users_dir)
+        # Note: _load_hist_users is deferred until AFTER _load_schema so the
+        # hist meta-vs-live schema verification has access to user_int_schema
+        # etc.
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+
+        # Load hist lookup AFTER _load_schema (the loader cross-checks meta
+        # against user_int_schema / user_dense_schema / pair_int_schema /
+        # pair_dense_schema).
+        if hist_users_dir is not None:
+            self._load_hist_users(hist_users_dir)
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
