@@ -875,6 +875,51 @@ def create_sequence_encoder(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+class DINBias(nn.Module):
+    """Target-aware attention pooling (DIN-style).
+
+    Given a single target vector and a history sequence, computes attention
+    weights via an additive MLP over [t, h, t-h, t*h] and returns the
+    masked weighted sum. The output is injected as a bias on the cross-attn
+    query so that the query becomes item-aware before attending the sequence.
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 2) -> None:
+        super().__init__()
+        hidden = d_model * hidden_mult
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model * 4, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(
+        self,
+        target: torch.Tensor,
+        hist: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            target: (B, D) target vector (e.g. mean-pooled item_ns).
+            hist: (B, L, D) history sequence tokens.
+            key_padding_mask: (B, L) True indicates padding positions.
+
+        Returns:
+            (B, D) target-aware pooled vector.
+        """
+        L = hist.shape[1]
+        t = target.unsqueeze(1).expand(-1, L, -1)
+        feat = torch.cat([t, hist, t - hist, t * hist], dim=-1)
+        score = self.mlp(feat).squeeze(-1)
+        all_pad = key_padding_mask.all(dim=1, keepdim=True)
+        score = score.masked_fill(key_padding_mask, -1e9)
+        attn = torch.softmax(score, dim=-1)
+        out = torch.einsum("bl,bld->bd", attn, hist)
+        out = torch.where(all_pad, torch.zeros_like(out), out)
+        return out
+
+
 class MultiSeqHyFormerBlock(nn.Module):
     """Multi-sequence HyFormer block.
 
@@ -896,11 +941,22 @@ class MultiSeqHyFormerBlock(nn.Module):
         top_k: int = 50,
         causal: bool = False,
         rank_mixer_mode: str = "full",
+        use_din: bool = False,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
         self.num_queries = num_queries
         self.num_ns = num_ns
+        self.use_din = use_din
+
+        # Optional DIN: per-sequence target-aware pooling that biases the
+        # cross-attn query with item_ns information before each block.
+        if use_din:
+            self.din_attns = nn.ModuleList(
+                [DINBias(d_model) for _ in range(num_sequences)]
+            )
+        else:
+            self.din_attns = None
 
         # Independent sequence encoder per sequence
         self.seq_encoders = nn.ModuleList(
@@ -946,6 +1002,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         seq_padding_masks: list,
         rope_cos_list: Optional[List[torch.Tensor]] = None,
         rope_sin_list: Optional[List[torch.Tensor]] = None,
+        item_ns_slice: Optional[torch.Tensor] = None,
     ) -> Tuple[list, torch.Tensor, list, list]:
         """Processes one multi-sequence HyFormer block step.
 
@@ -983,13 +1040,27 @@ class MultiSeqHyFormerBlock(nn.Module):
             next_seqs.append(next_seq_i)
             next_masks.append(mask_i)
 
-        # 2. Independent Query Decoding per sequence
+        # 2. Optional DIN: item_ns as target, attend over each evolved
+        # sequence, broadcast pooled vector onto the cross-attn query so
+        # queries become item-aware before Query Decoding.
+        din_biases = None
+        if self.use_din and item_ns_slice is not None:
+            target = item_ns_slice.mean(dim=1)  # (B, D)
+            din_biases = [
+                self.din_attns[i](target, next_seqs[i], next_masks[i])
+                for i in range(S)
+            ]
+
+        # 3. Independent Query Decoding per sequence
         decoded_qs = []
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
+            q_in = q_tokens_list[i]
+            if din_biases is not None:
+                q_in = q_in + din_biases[i].unsqueeze(1)
             decoded_q_i = self.cross_attns[i](
-                q_tokens_list[i],
+                q_in,
                 next_seqs[i],
                 next_masks[i],
                 rope_cos=rc,
@@ -1498,6 +1569,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.cross_ns_tokenizer = None
+        self.use_din = use_din
 
         # ================== NS Tokens Construction ==================
 
@@ -1595,6 +1667,10 @@ class PCVRHyFormer(nn.Module):
             + num_item_ns
             + (1 if self.has_item_dense else 0)
         )
+
+        # Slice of item_ns inside the concatenated ns_tokens (used by DIN).
+        self._item_ns_start = num_user_ns + (2 if self.has_user_dense else 0)
+        self._item_ns_end = self._item_ns_start + num_item_ns
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1715,6 +1791,7 @@ class PCVRHyFormer(nn.Module):
                     top_k=seq_top_k,
                     causal=seq_causal,
                     rank_mixer_mode=rank_mixer_mode,
+                    use_din=use_din,
                 )
                 for _ in range(num_hyformer_blocks)
             ]
@@ -2067,6 +2144,11 @@ class PCVRHyFormer(nn.Module):
                     rope_cos_list.append(cos)
                     rope_sin_list.append(sin)
 
+            item_ns_slice = (
+                curr_ns[:, self._item_ns_start : self._item_ns_end, :]
+                if self.use_din
+                else None
+            )
             curr_qs, curr_ns, curr_seqs, curr_masks = block(
                 q_tokens_list=curr_qs,
                 ns_tokens=curr_ns,
@@ -2074,6 +2156,7 @@ class PCVRHyFormer(nn.Module):
                 seq_padding_masks=curr_masks,
                 rope_cos_list=rope_cos_list,
                 rope_sin_list=rope_sin_list,
+                item_ns_slice=item_ns_slice,
             )
 
         return self._domain_sequence_gate(
