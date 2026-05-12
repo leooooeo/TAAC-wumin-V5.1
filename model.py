@@ -1800,9 +1800,10 @@ class PCVRHyFormer(nn.Module):
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
 
-        if self.num_time_buckets > 0:
-            nn.init.xavier_normal_(self.time_embedding.weight.data)
-            self.time_embedding.weight.data[0, :] = 0
+        if self.use_time_buckets:
+            for emb in self.time_embeddings.values():
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1857,9 +1858,9 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
-        # time_embedding is always preserved
-        if self.num_time_buckets > 0:
-            skip_count += 1
+        # time_embeddings (one per domain) are always preserved
+        if self.use_time_buckets:
+            skip_count += len(self.time_embeddings)
 
         logging.info(
             f"Re-initialized {reinit_count} high-cardinality Embeddings "
