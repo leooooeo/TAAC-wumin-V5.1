@@ -43,21 +43,19 @@ fi
 # ---- Resolve hist lookup directory under USER_CACHE_PATH ----
 HIST_USERS_DIR="${USER_CACHE_PATH}/item_hist_${HIST_TAG}"
 
-# ---- Build hist lookup if missing (or forced via build_hist) ----
-if [ "$BUILD_ONLY" = true ] || [ ! -f "${HIST_USERS_DIR}/meta.json" ]; then
-    echo "[run.sh] Building item-history-user lookup -> ${HIST_USERS_DIR}"
-    if ! python3 -u "${SCRIPT_DIR}/build_item_hist_users.py" \
-        --data_dir "${TRAIN_DATA_PATH}" \
-        --out_dir "${HIST_USERS_DIR}"; then
-        echo "[run.sh] build_item_hist_users.py FAILED — aborting before train"
-        exit 1
-    fi
-    if [ ! -f "${HIST_USERS_DIR}/meta.json" ]; then
-        echo "[run.sh] build script returned 0 but meta.json is missing — aborting"
-        exit 1
-    fi
-else
-    echo "[run.sh] Reusing existing hist lookup at ${HIST_USERS_DIR}"
+# ---- Build hist lookup (always — the script itself wipes + rewrites in ~15s,
+# which is negligible vs the risk of training against a stale schema). The
+# build script takes care of cleaning any orphan files before writing. ----
+echo "[run.sh] Building item-history-user lookup -> ${HIST_USERS_DIR}"
+if ! python3 -u "${SCRIPT_DIR}/build_item_hist_users.py" \
+    --data_dir "${TRAIN_DATA_PATH}" \
+    --out_dir "${HIST_USERS_DIR}"; then
+    echo "[run.sh] build_item_hist_users.py FAILED — aborting before train"
+    exit 1
+fi
+if [ ! -f "${HIST_USERS_DIR}/meta.json" ]; then
+    echo "[run.sh] build script returned 0 but meta.json is missing — aborting"
+    exit 1
 fi
 if [ "$BUILD_ONLY" = true ]; then
     exit 0
