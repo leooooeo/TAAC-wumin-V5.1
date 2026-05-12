@@ -68,10 +68,9 @@ _FALLBACK_MODEL_CFG = {
     "user_ns_tokens": 0,
     "item_ns_tokens": 0,
     "use_din": False,
-    # ── Item-history-user defaults (off; turned on when train_config carries
-    # enable_hist_users=True). ``hist_scalar_fid_positions`` is resolved from
-    # the schema in build_model, not from train_config, so we omit it here.
-    "enable_hist_users": False,
+    # ── Item-history-user is required at infer time. We don't include
+    # ``enable_hist_users`` in the fallback map because there is no "off" mode:
+    # main() asserts it and the model is always built with hist on.
     "hist_dense_dim": 256,
     "hist_dropout": 0.1,
 }
@@ -236,23 +235,22 @@ def build_model(
         dataset.item_int_schema, dataset.item_int_vocab_sizes
     )
 
-    # Resolve hist_scalar_fid_positions when the checkpoint was trained with
-    # the hist branch on. We keep the fid list identical to train.py
-    # (HIST_SCALAR_FIDS = [1, 48..53]); the positions vary per schema and must
-    # therefore be recomputed at infer time.
-    if model_cfg.get("enable_hist_users"):
-        hist_fids = [1, 48, 49, 50, 51, 52, 53]
-        fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)}
-        try:
-            model_cfg = {
-                **model_cfg,
-                "hist_scalar_fid_positions": [fid_to_idx[f] for f in hist_fids],
-            }
-        except KeyError as exc:
-            raise KeyError(
-                f"hist scalar fid {exc.args[0]} missing from schema; the "
-                f"checkpoint expects it for the hist branch."
-            ) from exc
+    # The hist branch is mandatory at infer time. Resolve positions of the 7
+    # scalar fids in the live schema (the indices vary per schema, so they
+    # can't be cached in train_config).
+    hist_fids = [1, 48, 49, 50, 51, 52, 53]
+    fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)}
+    try:
+        model_cfg = {
+            **model_cfg,
+            "enable_hist_users": True,
+            "hist_scalar_fid_positions": [fid_to_idx[f] for f in hist_fids],
+        }
+    except KeyError as exc:
+        raise KeyError(
+            f"hist scalar fid {exc.args[0]} missing from schema; the "
+            f"checkpoint expects it for the hist branch."
+        ) from exc
 
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
@@ -372,15 +370,20 @@ def main() -> None:
     model_dir = os.environ.get("MODEL_OUTPUT_PATH")
     data_dir = os.environ.get("EVAL_DATA_PATH")
     result_dir = os.environ.get("EVAL_RESULT_PATH")
-    # Optional: directory produced by build_item_hist_users.py over the
-    # training data. The same file serves training and inference — test rows
-    # look up their item_id in it, and because test ts > all train ts the
-    # temporal cut at runtime trivially exposes the full training history.
-    # Required only if the checkpoint was trained with enable_hist_users=True;
-    # otherwise it is ignored.
+    # Directory produced by build_item_hist_users.py over the training data.
+    # The same file serves training and inference — test rows look up their
+    # item_id in it, and because test ts > all train ts the temporal cut at
+    # runtime trivially exposes the full training history. REQUIRED.
     hist_users_dir = os.environ.get("EVAL_HIST_USERS_DIR")
+    if not hist_users_dir:
+        raise ValueError(
+            "EVAL_HIST_USERS_DIR is not set. The hist branch is mandatory at "
+            "infer time; build the item-history table with build_item_hist_users.py "
+            "and point EVAL_HIST_USERS_DIR at its output directory."
+        )
     # Sampling budget; default to "use everything" for inference so the test
-    # row sees as much training history per item as possible.
+    # row sees as much training history per item as possible. time_gap=0
+    # because test ts is later than all training ts — no leakage risk.
     hist_k_pos = int(os.environ.get("EVAL_HIST_K_POS", "32"))
     hist_k_neg = int(os.environ.get("EVAL_HIST_K_NEG", "64"))
     hist_time_gap = int(os.environ.get("EVAL_HIST_TIME_GAP", "0"))
