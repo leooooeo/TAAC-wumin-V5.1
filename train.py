@@ -41,7 +41,7 @@ def build_feature_specs(
 # Stable user scalar fids selected from EDA (present% ≥ 99.5%); matches the set
 # used by build_item_hist_users.py. Their index in user_int_schema.entries lets
 # ItemHistUserModule reuse the matching Embedding tables in user_ns_tokenizer.
-HIST_SCALAR_FIDS: List[int] = [1, 48, 49, 50, 51, 52, 53]
+HIST_SCALAR_FIDS: List[int] = [1, 3, 4, 48, 49, 50, 51, 52, 53, 55, 56, 57]
 
 
 def _resolve_hist_scalar_positions(user_int_schema: FeatureSchema) -> List[int]:
@@ -591,7 +591,8 @@ def main() -> None:
                 "hist_scalar_fid_positions": _resolve_hist_scalar_positions(
                     pcvr_dataset.user_int_schema
                 ),
-                "hist_dense_dim": 256,
+                "hist_dense_dim_61": 256,
+                "hist_dense_dim_87": 320,
                 "hist_dropout": args.hist_dropout,
             }
             if args.hist_users_dir

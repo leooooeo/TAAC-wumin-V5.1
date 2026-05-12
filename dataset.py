@@ -346,10 +346,12 @@ class PCVRParquetDataset(IterableDataset):
                 meta.json + *.npy inside). When provided, every yielded batch
                 carries six extra tensors used by the model's
                 ``ItemHistUserModule``:
-                ``hist_pos_scalars`` (B, k_pos, 7) int64,
-                ``hist_pos_dense``   (B, k_pos, 256) float32,
-                ``hist_neg_scalars`` (B, k_neg, 7) int64,
-                ``hist_neg_dense``   (B, k_neg, 256) float32,
+                ``hist_pos_scalars`` (B, k_pos, 12) int64,
+                ``hist_pos_dense61`` (B, k_pos, 256) float32,
+                ``hist_pos_dense87`` (B, k_pos, 320) float32,
+                ``hist_neg_scalars`` (B, k_neg, 12) int64,
+                ``hist_neg_dense61`` (B, k_neg, 256) float32,
+                ``hist_neg_dense87`` (B, k_neg, 320) float32,
                 ``hist_pos_lens`` / ``hist_neg_lens`` (B,) int32.
                 The file is shared by train and infer: each batch looks up its
                 rows' ``item_id`` and samples hist users with ``timestamp <
@@ -686,7 +688,8 @@ class PCVRParquetDataset(IterableDataset):
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
-        self.hist_dense_dim = int(meta["dense_dim"])
+        self.hist_dense_dim_61 = int(meta["dense_dim_61"])
+        self.hist_dense_dim_87 = int(meta["dense_dim_87"])
         self.hist_num_scalars = len(meta["scalar_fids"])
 
         # Small arrays live fully in RAM (driving the per-row searchsorted).
@@ -703,18 +706,21 @@ class PCVRParquetDataset(IterableDataset):
         load_mm = lambda name: np.load(
             os.path.join(hist_users_dir, name), mmap_mode="r"
         )
-        self._hist_user_scalars = load_mm("int_user_scalars.npy")   # (M, 7) i32
-        self._hist_user_dense = load_mm("int_user_dense.npy")       # (M, 256) f16
+        self._hist_user_scalars = load_mm("int_user_scalars.npy")   # (M, 12) i32
+        self._hist_user_dense_61 = load_mm("int_user_dense61.npy")  # (M, 256) f16
+        self._hist_user_dense_87 = load_mm("int_user_dense87.npy")  # (M, 320) f16
 
         M = self._hist_ts.shape[0]
         assert self._hist_label.shape == (M,)
         assert self._hist_user_scalars.shape[0] == M
-        assert self._hist_user_dense.shape == (M, self.hist_dense_dim)
+        assert self._hist_user_dense_61.shape == (M, self.hist_dense_dim_61)
+        assert self._hist_user_dense_87.shape == (M, self.hist_dense_dim_87)
 
         self._hist_loaded = True
         logging.info(
             f"hist_users loaded from {hist_users_dir}: items={len(self._hist_item_ids):,}, "
-            f"interactions={M:,}, dense_dim={self.hist_dense_dim}, "
+            f"interactions={M:,}, scalars={self.hist_num_scalars}, "
+            f"dense_dim_61={self.hist_dense_dim_61}, dense_dim_87={self.hist_dense_dim_87}, "
             f"k_pos={self.hist_k_pos}, k_neg={self.hist_k_neg}, "
             f"time_gap={self.hist_time_gap}s"
         )
@@ -749,7 +755,6 @@ class PCVRParquetDataset(IterableDataset):
         B = item_ids.shape[0]
         k_pos = self.hist_k_pos
         k_neg = self.hist_k_neg
-        D = self.hist_dense_dim
         n_fids = self.hist_num_scalars
 
         # Output buffers — written row-by-row, gathered at the end.
@@ -812,21 +817,29 @@ class PCVRParquetDataset(IterableDataset):
         pos_scalars = np.asarray(
             self._hist_user_scalars[pos_rows], dtype=np.int64
         )                                                # (B, k_pos, n_fids)
-        pos_dense = np.asarray(
-            self._hist_user_dense[pos_rows], dtype=np.float32
-        )                                                # (B, k_pos, D)
+        pos_dense_61 = np.asarray(
+            self._hist_user_dense_61[pos_rows], dtype=np.float32
+        )                                                # (B, k_pos, 256)
+        pos_dense_87 = np.asarray(
+            self._hist_user_dense_87[pos_rows], dtype=np.float32
+        )                                                # (B, k_pos, 320)
         neg_scalars = np.asarray(
             self._hist_user_scalars[neg_rows], dtype=np.int64
         )
-        neg_dense = np.asarray(
-            self._hist_user_dense[neg_rows], dtype=np.float32
+        neg_dense_61 = np.asarray(
+            self._hist_user_dense_61[neg_rows], dtype=np.float32
+        )
+        neg_dense_87 = np.asarray(
+            self._hist_user_dense_87[neg_rows], dtype=np.float32
         )
 
         return {
             "hist_pos_scalars": torch.from_numpy(pos_scalars),
-            "hist_pos_dense": torch.from_numpy(pos_dense),
+            "hist_pos_dense61": torch.from_numpy(pos_dense_61),
+            "hist_pos_dense87": torch.from_numpy(pos_dense_87),
             "hist_neg_scalars": torch.from_numpy(neg_scalars),
-            "hist_neg_dense": torch.from_numpy(neg_dense),
+            "hist_neg_dense61": torch.from_numpy(neg_dense_61),
+            "hist_neg_dense87": torch.from_numpy(neg_dense_87),
             "hist_pos_lens": torch.from_numpy(pos_lens),
             "hist_neg_lens": torch.from_numpy(neg_lens),
         }
