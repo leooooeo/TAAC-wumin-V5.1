@@ -43,6 +43,16 @@ fi
 # ---- Resolve hist lookup directory under USER_CACHE_PATH ----
 HIST_USERS_DIR="${USER_CACHE_PATH}/item_hist_${HIST_TAG}"
 
+# ---- Wipe USER_CACHE_PATH to keep under its 20GB quota. Everything in this
+# directory is regenerated downstream (currently the item-history table built
+# right below); previous experiments left behind several GB of stale .pkl
+# / .npy artifacts that nothing reads any more. The guard avoids the
+# catastrophic "rm -rf /*" pattern if USER_CACHE_PATH is unset. ----
+if [ -n "$USER_CACHE_PATH" ] && [ -d "$USER_CACHE_PATH" ]; then
+    echo "[run.sh] Wiping USER_CACHE_PATH=$USER_CACHE_PATH"
+    rm -rf -- "$USER_CACHE_PATH"/* "$USER_CACHE_PATH"/.[!.]* 2>/dev/null || true
+fi
+
 # ---- Build hist lookup (always — the script itself wipes + rewrites in ~15s,
 # which is negligible vs the risk of training against a stale schema). The
 # build script takes care of cleaning any orphan files before writing. ----
