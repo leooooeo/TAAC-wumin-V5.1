@@ -146,6 +146,16 @@ def main() -> None:
         raise ValueError("--data_dir (or $TRAIN_DATA_PATH) required")
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Wipe stale artifacts from any previous build before writing fresh files.
+    # Without this, switching schemas (e.g. M0 ↔ M1) leaves orphan .npy files
+    # that confuse the dataset loader. We only delete files this script owns —
+    # the directory itself and any other content stay intact.
+    _OWNED = {"meta.json"}
+    for name in os.listdir(args.out_dir):
+        if name.endswith(".npy") or name in _OWNED:
+            os.remove(os.path.join(args.out_dir, name))
+    logging.info(f"cleaned stale artifacts in {args.out_dir}")
+
     files = list_files(args.data_dir)
     total_rows = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
     logging.info(
